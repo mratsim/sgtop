@@ -608,7 +608,11 @@ fn draw_rate_graph(
         Span::styled(format!("({gloss}) "), Style::new().fg(t.dim)),
         Span::styled(
             format!(
-                "\u{2014} now {:.0} \u{b7} peak {:.0} ",
+                "\u{2014} {} {:.0} \u{b7} peak {:.0} ",
+                match which {
+                    RateGraph::Prefill => "now",
+                    RateGraph::Decode => "agg now",
+                },
                 instant.unwrap_or(0.0),
                 scale
             ),
@@ -636,7 +640,7 @@ fn draw_rate_graph(
             if n > 0 {
                 spans.push(Span::styled(
                     format!(
-                        "\u{b7} stream avg {:.0} \u{b7} stream peak {:.0} ",
+                        "\u{b7} per-stream avg {:.0} \u{b7} per-stream peak {:.0} ",
                         sum / n as f64,
                         peak
                     ),
