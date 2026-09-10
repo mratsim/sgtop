@@ -1,6 +1,6 @@
 [package]
 name = "sgtop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "btop-style live TUI for a sglang inference server"
 license = "MIT"
