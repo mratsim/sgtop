@@ -1377,10 +1377,10 @@ fn eviction_lane_pairs_nothing_across_an_absence() {
 // between the window's first sample and the position's later sample, so the newest point
 // is the window's headline quantile and earlier points cover a shorter growing span.
 // Hand-computed: position 1 sees 5 observations in (0, 0.5]: p50 rank 2.5 gives 0.25, p95
-// rank 4.75 gives 0.475. Position 2 adds 10 in (0.5, 2] and 20 in (2, 8]: p50 rank 12.5
-// gives 1.625 and p95 rank 23.75 gives 7.25. A per-interval delta reading of position 2
-// would give 2.0 instead, since rank 10 of 10 in the (0.5, 2] bucket interpolates
-// toward its upper bound: this pin tells the two readings apart.
+// rank 4.75 gives 0.475. Position 2 adds 10 in (0.5, 2] and 20 in (2, 8]: p95
+// rank 23.75 gives 7.25. A per-interval delta reading of position 2 would give
+// 2.0 instead, since rank 10 of 10 in the (0.5, 2] bucket interpolates toward
+// its upper bound: this pin tells the two readings apart.
 #[test]
 fn latency_series_is_the_window_span_delta_per_position() {
     let ttft = |cum: [f64; 4]| {
@@ -1403,7 +1403,6 @@ fn latency_series_is_the_window_span_delta_per_position() {
     h.push(t0 + Duration::from_secs(1), ttft([5.0, 5.0, 5.0, 5.0]));
     h.push(t0 + Duration::from_secs(2), ttft([5.0, 15.0, 25.0, 25.0]));
     let d = derive(&h, 2).unwrap();
-    assert_eq!(d.graphs.ttft_p50, vec![Some(0.25), Some(1.625)]);
     assert_eq!(d.graphs.ttft_p95, vec![Some(0.475), Some(7.25)]);
 }
 
@@ -1432,14 +1431,10 @@ fn latency_series_stores_no_quantile_when_the_span_is_sparse() {
     h.push(t0 + Duration::from_secs(3), ttft([6.0, 6.0]));
     let d = derive(&h, 2).unwrap();
     // positions 1 and 2 hold 2 and 4 observations, below the bar. Position 3's
-    // 6-observation span interpolates: p50 rank 3 lands on 0.25, p95 rank 5.7 on 0.475,
-    // compared with an epsilon because the rank itself carries binary float rounding
-    let p50 = d.graphs.ttft_p50[2].unwrap();
+    // 6-observation span interpolates: p95 rank 5.7 lands on 0.475, compared
+    // with an epsilon because the rank itself carries binary float rounding
     let p95 = d.graphs.ttft_p95[2].unwrap();
-    assert!((p50 - 0.25).abs() < 1e-9, "p50 was {p50}");
     assert!((p95 - 0.475).abs() < 1e-9, "p95 was {p95}");
-    assert_eq!(d.graphs.ttft_p50[0], None);
-    assert_eq!(d.graphs.ttft_p50[1], None);
 }
 
 // The newest plot point is computed from the same span as the headline 60s quantile:
@@ -1451,7 +1446,6 @@ fn latency_series_stores_no_quantile_when_the_span_is_sparse() {
 fn newest_plot_point_matches_the_headline_quantile() {
     let d = busy_derived();
     assert_eq!(d.graphs.ttft_p95.last().copied().flatten(), d.ttft[2].p95);
-    assert_eq!(d.graphs.ttft_p50.last().copied().flatten(), d.ttft[2].p50);
 
     // sparse window: 2+2 observations across the whole window, below the bar
     let ttft = |cum: [f64; 2]| {
@@ -1472,11 +1466,43 @@ fn newest_plot_point_matches_the_headline_quantile() {
     h.push(t0 + Duration::from_secs(1), ttft([2.0, 2.0]));
     h.push(t0 + Duration::from_secs(2), ttft([4.0, 4.0]));
     let d = derive(&h, 2).unwrap();
-    // the headline echoes the since-start snapshot (4 obs <= 0.5: rank 2 -> 0.25)
-    let headline = d.ttft[2].p50.unwrap();
-    assert!((headline - 0.25).abs() < 1e-9, "headline was {headline}");
+    // the headline echoes the since-start snapshot (4 obs <= 0.5: rank 3.8 -> 0.475)
+    let headline = d.ttft[2].p95.unwrap();
+    assert!((headline - 0.475).abs() < 1e-9, "headline was {headline}");
     // the plot point stays None: no measured window span to interpolate
-    assert_eq!(d.graphs.ttft_p50.last().copied().flatten(), None);
+    assert_eq!(d.graphs.ttft_p95.last().copied().flatten(), None);
+}
+
+// merge_le nets bucket deltas across label combinations, so a reset inside one
+// combination can hide against growth in another (-4 and +200 merge to +196).
+// The reset check therefore runs on the raw per-combination deltas,
+// before any merging: the plotted span stores a gap, never a quantile
+// of a broken span.
+#[test]
+fn a_reset_in_one_label_combination_gaps_the_window_span() {
+    let ttft = |a: f64, b: f64| {
+        parse(&format!(
+            "# TYPE sglang:time_to_first_token_seconds histogram\n\
+             sglang:time_to_first_token_seconds_bucket{{name=\"a\",le=\"0.5\"}} {a}\n\
+             sglang:time_to_first_token_seconds_bucket{{name=\"a\",le=\"+Inf\"}} {a}\n\
+             sglang:time_to_first_token_seconds_count{{name=\"a\"}} {a}\n\
+             sglang:time_to_first_token_seconds_bucket{{name=\"b\",le=\"0.5\"}} {b}\n\
+             sglang:time_to_first_token_seconds_bucket{{name=\"b\",le=\"+Inf\"}} {b}\n\
+             sglang:time_to_first_token_seconds_count{{name=\"b\"}} {b}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 2\n"
+        ))
+        .unwrap()
+    };
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, ttft(4.0, 0.0));
+    h.push(t0 + Duration::from_secs(1), ttft(0.0, 200.0));
+    let d = derive(&h, 2).unwrap();
+    // combination a lost its 4 observations while b grew by 200: the merged
+    // ladder reads +196 and would interpolate a p95 from a span that mixes
+    // a reset with growth
+    assert_eq!(d.graphs.ttft_p95.last(), Some(&None));
 }
 
 // The cache hit fraction comes from the effective-prefill counter's windowed

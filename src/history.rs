@@ -170,8 +170,11 @@ impl History {
         let new = self.buf.back()?;
 
         let (raw, delta_count) = hist_family_deltas(&old.sample, &new.sample, &pred);
+        // a reset in any single label combination is a family reset:
+        // merging first can net a negative delta against a positive
+        // one and read a broken span as valid
+        let reset = raw.iter().any(|(_, d)| *d < -0.5);
         let merged = merge_le(raw);
-        let reset = merged.iter().any(|(_, d)| *d < -0.5);
         if merged.is_empty() || reset || delta_count < QUANTILE_MIN_OBS {
             return self.hist_snapshot_quantile(&pred, q);
         }
@@ -326,29 +329,27 @@ where
     (merged, delta_count)
 }
 
-/// p50 and p95 of a histogram family over the span between two samples, from the bucket
-/// deltas (`hist_family_deltas`). One latency point of the per-position series the latency
-/// plots draw: the span runs from the window's first sample to the position's later sample,
-/// so the newest point is the window's headline quantile. Returns None for a span too
-/// sparse to interpolate or a ladder delta that went backwards (a reset). "Too sparse"
-/// means fewer than QUANTILE_MIN_OBS observations, the same bar `hist_quantile` applies. No snapshot
-/// fallback runs, so a plotted point is only ever measured data.
-pub(crate) fn hist_window_quantiles<F>(
-    old: &Sample,
-    new: &Sample,
-    pred: &F,
-) -> (Option<f64>, Option<f64>)
+/// Plotted-series p95 of a histogram family, from the bucket deltas
+/// (`hist_family_deltas`). One latency point of the per-position series
+/// the latency plots draw: the span runs from the window's first sample
+/// to the position's later sample, so the newest point is the window's
+/// headline quantile. Returns None for a span too sparse to interpolate
+/// or a ladder delta that went backwards (a reset). "Too sparse" means
+/// fewer than QUANTILE_MIN_OBS observations, the bar `hist_quantile` applies.
+/// A span never falls back to a snapshot, so a plotted point holds
+/// measured data, never a snapshot echo.
+pub(crate) fn hist_window_p95<F>(old: &Sample, new: &Sample, pred: &F) -> Option<f64>
 where
     F: Fn(&SeriesKey) -> bool,
 {
     let (raw, delta_count) = hist_family_deltas(old, new, pred);
+    // a reset in any single label combination is a family reset:
+    // merging first can net a negative delta against a positive
+    // one and read a broken span as valid
+    let reset = raw.iter().any(|(_, d)| *d < -0.5);
     let merged = merge_le(raw);
-    let reset = merged.iter().any(|(_, d)| *d < -0.5);
     if merged.is_empty() || reset || delta_count < QUANTILE_MIN_OBS {
-        return (None, None);
+        return None;
     }
-    (
-        quantile_from_buckets(&merged, 0.50),
-        quantile_from_buckets(&merged, 0.95),
-    )
+    quantile_from_buckets(&merged, 0.95)
 }

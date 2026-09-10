@@ -133,8 +133,8 @@ fn full_layout_renders_key_panels() {
         out.contains("full = requests queue"),
         "pools occupancy gloss missing"
     );
-    // each pool renders on its own line, never joined by " · " on one
-    // truncated row; the KV line starts a row of its own
+    // each pool renders on its own line, never joined by
+    // " · " on a truncated row; the KV line leads the pool block
     let kv_line = out
         .lines()
         .find(|l| l.contains("KV 0/655k tok"))

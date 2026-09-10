@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::history::{counter_delta, hist_window_quantiles, History};
+use crate::history::{counter_delta, hist_window_p95, History};
 use crate::metrics::{Sample, SeriesKey};
 
 pub const WINDOWS: [Duration; 3] = [
@@ -120,8 +120,7 @@ pub struct Graphs {
     /// (queue + prefill). Cumulative bucket counters make each position's quantile the delta
     /// between the window's first sample and the position's later sample, so the newest point
     /// is the window's headline quantile. None while that span is too sparse to interpolate
-    /// (`hist_window_quantiles`): a gap in the plot is absence of measured data, never a zero.
-    pub ttft_p50: Vec<Option<f64>>,
+    /// (`hist_window_p95`): a gap in the plot is absence of measured data, never a zero.
     pub ttft_p95: Vec<Option<f64>>,
     /// Computed prompt tokens/s per scrape interval: the effective-prefill
     /// counter's `input` mode, the prompt text the prefix cache did not hold
@@ -440,7 +439,6 @@ pub fn scan_window(h: &History) -> Graphs {
     let mut prefill = Lane::default();
     let mut evictions = Lane::default();
     let mut running: Vec<f64> = Vec::new();
-    let mut ttft_p50: Vec<Option<f64>> = Vec::new();
     let mut ttft_p95: Vec<Option<f64>> = Vec::new();
     let mut cache_misses: Vec<Option<f64>> = Vec::new();
     let mut per_stream: Vec<Option<f64>> = Vec::new();
@@ -496,12 +494,11 @@ pub fn scan_window(h: &History) -> Graphs {
         // per-position latency: each point is the histogram bucket delta between the window's
         // first sample and this interval's later sample; the series starts sparse and ends
         // at the headline quantile
-        let (t50, t95) = hist_window_quantiles(
+        let t95 = hist_window_p95(
             &entries[0].sample,
             &pair[1].sample,
             &fam("sglang:time_to_first_token_seconds"),
         );
-        ttft_p50.push(t50);
         ttft_p95.push(t95);
         dt.push(d);
     }
@@ -526,7 +523,6 @@ pub fn scan_window(h: &History) -> Graphs {
         stall,
         evictions,
         cache_misses,
-        ttft_p50,
         ttft_p95,
         per_stream,
         dt,
