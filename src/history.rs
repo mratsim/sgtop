@@ -34,7 +34,10 @@ impl History {
         if self.buf.len() == RING_CAP {
             self.buf.pop_front();
         }
-        self.buf.push_back(Entry { t, sample: Arc::new(sample) });
+        self.buf.push_back(Entry {
+            t,
+            sample: Arc::new(sample),
+        });
     }
 
     pub fn len(&self) -> usize {
@@ -84,7 +87,11 @@ impl History {
                     continue;
                 }
                 let v_old = pair[0].sample.simple.get(k).copied().unwrap_or(0.0);
-                let delta = if *v_new < v_old { *v_new } else { *v_new - v_old };
+                let delta = if *v_new < v_old {
+                    *v_new
+                } else {
+                    *v_new - v_old
+                };
                 delta_sum += delta;
                 any = true;
             }
@@ -184,7 +191,17 @@ impl History {
     /// Slice of entries inside `window`, oldest first.
     pub fn window_entries(&self, window: Duration) -> Vec<Arc<Entry>> {
         match self.window_base(window) {
-            Some(base) => self.buf.iter().skip(base).map(|e| Arc::new(Entry { t: e.t, sample: e.sample.clone() })).collect(),
+            Some(base) => self
+                .buf
+                .iter()
+                .skip(base)
+                .map(|e| {
+                    Arc::new(Entry {
+                        t: e.t,
+                        sample: e.sample.clone(),
+                    })
+                })
+                .collect(),
             None => Vec::new(),
         }
     }
@@ -195,8 +212,8 @@ impl History {
 /// above the last finite bound) even though it cannot be interpolated into.
 fn merge_le(mut pairs: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     // keep finite bounds and +Inf (which counts toward the total);
-        // drop anything else (NaN, -Inf)
-        pairs.retain(|(le, v)| v.is_finite() && (le.is_finite() || *le == f64::INFINITY));
+    // drop anything else (NaN, -Inf)
+    pairs.retain(|(le, v)| v.is_finite() && (le.is_finite() || *le == f64::INFINITY));
     pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     let mut out: Vec<(f64, f64)> = Vec::new();
     for (le, v) in pairs {

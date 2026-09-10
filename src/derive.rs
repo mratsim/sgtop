@@ -159,9 +159,7 @@ fn detect_stalls(h: &History, running_now: f64) -> [Stalls; 3] {
             continue;
         }
         decode.push(interval_rate(&pair[0].sample, &pair[1].sample, "decode") / dt);
-        prefill.push(
-            interval_rate(&pair[0].sample, &pair[1].sample, "prefill_compute") / dt,
-        );
+        prefill.push(interval_rate(&pair[0].sample, &pair[1].sample, "prefill_compute") / dt);
         dts.push(dt);
     }
 
@@ -235,9 +233,9 @@ pub fn update_peaks(peaks: &mut Peaks, h: &History) {
                 .map(|(k, v)| (k.clone(), *v))
                 .collect::<Vec<_>>()
         };
-        keys(&prev.sample).iter().any(|(k, v_old)| {
-            cur.sample.simple.get(k).map(|v| v < v_old).unwrap_or(false)
-        })
+        keys(&prev.sample)
+            .iter()
+            .any(|(k, v_old)| cur.sample.simple.get(k).map(|v| v < v_old).unwrap_or(false))
     });
     if had_reset {
         // the engine restarted: the old process's peaks are not this
@@ -268,7 +266,11 @@ fn interval_rate(old: &crate::metrics::Sample, new: &crate::metrics::Sample, mod
     for (k, v_new) in &new.simple {
         if key(k) {
             let v_old = old.simple.get(k).copied().unwrap_or(0.0);
-            delta += if *v_new < v_old { *v_new } else { *v_new - v_old };
+            delta += if *v_new < v_old {
+                *v_new
+            } else {
+                *v_new - v_old
+            };
         }
     }
     delta
@@ -300,7 +302,11 @@ fn build_graphs(h: &History) -> Graphs {
         decode.push(dr);
         prefill.push(pr);
         stall.push(dr < 0.25 * median_of(&decode) && running_at > 0.0 && pr > 0.0);
-        per_stream.push(if running_at > 0.0 { Some(dr / running_at) } else { None });
+        per_stream.push(if running_at > 0.0 {
+            Some(dr / running_at)
+        } else {
+            None
+        });
         // lanes are computed from raw counts so the graph matches the
         // title values; mamba_usage measures pages, not slots
         let s = &pair[1].sample;
@@ -315,30 +321,50 @@ fn build_graphs(h: &History) -> Graphs {
             s.gauge("sglang:mamba_used_tokens")
                 .map(|u| {
                     let total = u + s.gauge("sglang:mamba_available_tokens").unwrap_or(0.0);
-                    if total > 0.0 { (u / total).clamp(0.0, 1.0) } else { 0.0 }
+                    if total > 0.0 {
+                        (u / total).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
                 })
                 .unwrap_or(0.0),
         );
-        pool_host.push(match (
-            pair[1].sample.gauge("sglang:hicache_host_total_tokens"),
-            pair[1].sample.gauge("sglang:hicache_host_used_tokens"),
-        ) {
-            (Some(total), Some(used)) if total > 0.0 => used / total,
-            _ => 0.0,
-        });
+        pool_host.push(
+            match (
+                pair[1].sample.gauge("sglang:hicache_host_total_tokens"),
+                pair[1].sample.gauge("sglang:hicache_host_used_tokens"),
+            ) {
+                (Some(total), Some(used)) if total > 0.0 => used / total,
+                _ => 0.0,
+            },
+        );
         pool_swa.push(
             s.gauge("sglang:swa_used_tokens")
                 .map(|u| {
                     let total = u + s.gauge("sglang:swa_available_tokens").unwrap_or(0.0);
-                    if total > 0.0 { (u / total).clamp(0.0, 1.0) } else { 0.0 }
+                    if total > 0.0 {
+                        (u / total).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
                 })
                 .unwrap_or(0.0),
         );
-    
+
         dt.push(d);
     }
 
-    Graphs { decode, prefill, stall, pool_kv, pool_mamba, pool_host, pool_swa, per_stream, dt }
+    Graphs {
+        decode,
+        prefill,
+        stall,
+        pool_kv,
+        pool_mamba,
+        pool_host,
+        pool_swa,
+        per_stream,
+        dt,
+    }
 }
 
 fn median_of(v: &[f64]) -> f64 {
@@ -349,7 +375,6 @@ fn median_of(v: &[f64]) -> f64 {
         n => s[n / 2],
     }
 }
-
 
 /// Per-tier cache hit rate per sglang's documented formula:
 /// rate(mode=<tier>) / rate(sum of all modes) — windowed.
@@ -386,11 +411,26 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
     let queue = h.gauge_pred(fam("sglang:num_queue_reqs"));
 
     let subqueues: Vec<(&'static str, Option<f64>)> = vec![
-        ("prefill bootstrap", h.gauge_pred(fam("sglang:num_prefill_bootstrap_queue_reqs"))),
-        ("prefill inflight", h.gauge_pred(fam("sglang:num_prefill_inflight_queue_reqs"))),
-        ("decode prealloc", h.gauge_pred(fam("sglang:num_decode_prealloc_queue_reqs"))),
-        ("decode transfer", h.gauge_pred(fam("sglang:num_decode_transfer_queue_reqs"))),
-        ("grammar", h.gauge_pred(fam("sglang:num_grammar_queue_reqs"))),
+        (
+            "prefill bootstrap",
+            h.gauge_pred(fam("sglang:num_prefill_bootstrap_queue_reqs")),
+        ),
+        (
+            "prefill inflight",
+            h.gauge_pred(fam("sglang:num_prefill_inflight_queue_reqs")),
+        ),
+        (
+            "decode prealloc",
+            h.gauge_pred(fam("sglang:num_decode_prealloc_queue_reqs")),
+        ),
+        (
+            "decode transfer",
+            h.gauge_pred(fam("sglang:num_decode_transfer_queue_reqs")),
+        ),
+        (
+            "grammar",
+            h.gauge_pred(fam("sglang:num_grammar_queue_reqs")),
+        ),
     ];
 
     // pools: KV always; mamba/SWA render once the engine has shown a live
@@ -475,17 +515,19 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
     }
 
     let running_now = running.unwrap_or(0.0);
-    let gen_progress = match (
-        h.gauge_pred(fam("sglang:decode_sum_seq_lens")),
-        running_now,
-    ) {
+    let gen_progress = match (h.gauge_pred(fam("sglang:decode_sum_seq_lens")), running_now) {
         (Some(s), r) if r > 0.0 => Some(s / r),
         _ => None,
     };
 
-    let decode_rate = rate_triple(h, fam_labeled("sglang:realtime_tokens_total", "mode", "decode"));
-    let prefill_rate =
-        rate_triple(h, fam_labeled("sglang:realtime_tokens_total", "mode", "prefill_compute"));
+    let decode_rate = rate_triple(
+        h,
+        fam_labeled("sglang:realtime_tokens_total", "mode", "decode"),
+    );
+    let prefill_rate = rate_triple(
+        h,
+        fam_labeled("sglang:realtime_tokens_total", "mode", "prefill_compute"),
+    );
     let evict_rate = h.rate_sum(fam("sglang:evicted_tokens_total"), WINDOWS[2]);
     let retract_rate = h.rate_sum(fam("sglang:num_retracted_reqs"), WINDOWS[2]);
     let http_503_rate = h.rate_sum(
@@ -497,10 +539,17 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
         WINDOWS[2],
     );
     let cpu_detokenizer = h.rate_sum(
-        fam_labeled("sglang:process_cpu_seconds_total", "component", "detokenizer"),
+        fam_labeled(
+            "sglang:process_cpu_seconds_total",
+            "component",
+            "detokenizer",
+        ),
         WINDOWS[2],
     );
-    let cpu_scheduler = h.rate_sum(fam("sglang:scheduler_process_cpu_seconds_total"), WINDOWS[2]);
+    let cpu_scheduler = h.rate_sum(
+        fam("sglang:scheduler_process_cpu_seconds_total"),
+        WINDOWS[2],
+    );
 
     let ttft = latency_triple(h, "sglang:time_to_first_token_seconds");
     let itl = latency_triple(h, "sglang:inter_token_latency_seconds");
@@ -557,10 +606,7 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
         gen_throughput_gauge: h.gauge_pred(fam("sglang:gen_throughput")),
         l2_device: l2_hit_rate(h, "device_hit"),
         l2_host: l2_hit_rate(h, "host_hit"),
-        l2_wb: h.rate_sum(
-            fam("sglang:hicache_backup_tokens_total"),
-            WINDOWS[2],
-        ),
+        l2_wb: h.rate_sum(fam("sglang:hicache_backup_tokens_total"), WINDOWS[2]),
         l2_rb: h.rate_sum(fam("sglang:load_back_tokens_total"), WINDOWS[2]),
         l2_drop: h.rate_sum(fam("sglang:hicache_dropped_tokens_total"), WINDOWS[2]),
         new_token_ratio: h.gauge_pred(fam("sglang:new_token_ratio")),

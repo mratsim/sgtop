@@ -51,9 +51,7 @@ fn agent(insecure: bool, timeout: Duration) -> ureq::Agent {
 }
 
 mod danger {
-    use rustls::client::danger::{
-        HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-    };
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
     use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, Error, SignatureScheme};
 
@@ -104,12 +102,9 @@ mod danger {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        let algs = &rustls::crypto::ring::default_provider()
-            .signature_verification_algorithms;
+        let algs = &rustls::crypto::ring::default_provider().signature_verification_algorithms;
         rustls::crypto::verify_tls12_signature(message, cert, dss, algs)
-            .or_else(|_| {
-                rustls::crypto::verify_tls13_signature(message, cert, dss, algs)
-            })
+            .or_else(|_| rustls::crypto::verify_tls13_signature(message, cert, dss, algs))
     }
 }
 
@@ -123,21 +118,12 @@ pub fn metrics_url(base: &str) -> String {
     }
 }
 
-pub fn fetch_once(
-    url: &str,
-    api_key: Option<&str>,
-    insecure: bool,
-) -> Result<String> {
+pub fn fetch_once(url: &str, api_key: Option<&str>, insecure: bool) -> Result<String> {
     let agent = agent(insecure, Duration::from_secs(5));
     fetch(&agent, url, api_key)
 }
 
-pub fn spawn_scraper(
-    shared: Arc<Shared>,
-    url: String,
-    api_key: Option<String>,
-    insecure: bool,
-) {
+pub fn spawn_scraper(shared: Arc<Shared>, url: String, api_key: Option<String>, insecure: bool) {
     let agent = agent(insecure, Duration::from_secs(5));
     std::thread::spawn(move || loop {
         if !shared.paused.load(Ordering::Relaxed) {
@@ -182,7 +168,9 @@ fn fetch(agent: &ureq::Agent, url: &str, api_key: Option<&str>) -> Result<String
     let resp = req.call().context("scrape failed")?;
     let mut reader = resp.into_reader().take(64 * 1024 * 1024);
     let mut body = String::new();
-    reader.read_to_string(&mut body).context("reading scrape body")?;
+    reader
+        .read_to_string(&mut body)
+        .context("reading scrape body")?;
     Ok(body)
 }
 
@@ -192,8 +180,17 @@ mod tests {
 
     #[test]
     fn url_normalization() {
-        assert_eq!(metrics_url("http://localhost:30000"), "http://localhost:30000/metrics");
-        assert_eq!(metrics_url("http://localhost:30000/"), "http://localhost:30000/metrics");
-        assert_eq!(metrics_url("https://example.org/metrics"), "https://example.org/metrics");
+        assert_eq!(
+            metrics_url("http://localhost:30000"),
+            "http://localhost:30000/metrics"
+        );
+        assert_eq!(
+            metrics_url("http://localhost:30000/"),
+            "http://localhost:30000/metrics"
+        );
+        assert_eq!(
+            metrics_url("https://example.org/metrics"),
+            "https://example.org/metrics"
+        );
     }
 }

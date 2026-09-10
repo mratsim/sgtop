@@ -34,7 +34,10 @@ pub struct Sample {
 
 impl Sample {
     pub fn gauge(&self, name: &str) -> Option<f64> {
-        self.simple.iter().find(|(k, _)| k.name == name).map(|(_, v)| *v)
+        self.simple
+            .iter()
+            .find(|(k, _)| k.name == name)
+            .map(|(_, v)| *v)
     }
 }
 
@@ -109,8 +112,7 @@ pub fn parse(body: &str) -> Sample {
         } else {
             (name, 3, None)
         };
-        let is_hist = part < 3
-            && types.get(base).map(String::as_str) == Some("histogram");
+        let is_hist = part < 3 && types.get(base).map(String::as_str) == Some("histogram");
 
         if is_hist {
             let key = SeriesKey {
@@ -119,13 +121,22 @@ pub fn parse(body: &str) -> Sample {
             };
             let b = hists.entry(key).or_default();
             match part {
-                0 => b.buckets.push((le.unwrap(), value)),
+                // a bucket without a usable `le` bound can't participate in
+                // quantiles; skip it like any other malformed line
+                0 => {
+                    if let Some(le) = le {
+                        b.buckets.push((le, value));
+                    }
+                }
                 // _sum is parsed and discarded: mean latency is not displayed
                 1 => {}
                 _ => b.count = value.max(0.0) as u64,
             }
         } else {
-            let key = SeriesKey { name: name.to_string(), labels };
+            let key = SeriesKey {
+                name: name.to_string(),
+                labels,
+            };
             simple.insert(key, value);
         }
     }
@@ -135,11 +146,14 @@ pub fn parse(body: &str) -> Sample {
         .map(|(k, b)| {
             let mut buckets = b.buckets;
             buckets.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-            let (le, counts): (Vec<f64>, Vec<f64>) =
-                buckets.into_iter().unzip();
+            let (le, counts): (Vec<f64>, Vec<f64>) = buckets.into_iter().unzip();
             (
                 k,
-                HistSeries { le, counts, count: b.count },
+                HistSeries {
+                    le,
+                    counts,
+                    count: b.count,
+                },
             )
         })
         .collect();

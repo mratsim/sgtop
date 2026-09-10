@@ -13,7 +13,10 @@ fn main() -> Result<()> {
     if args.once {
         let mut h = sgtop::history::History::default();
         // two scrapes so windows have a base for rates/quantiles
-        for (i, wait) in [0.0, args.interval.clamp(0.5, 10.0)].into_iter().enumerate() {
+        for (i, wait) in [0.0, args.interval.clamp(0.5, 10.0)]
+            .into_iter()
+            .enumerate()
+        {
             if i > 0 {
                 std::thread::sleep(Duration::from_secs_f64(wait));
             }

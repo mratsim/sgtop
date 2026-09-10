@@ -5,15 +5,15 @@ use crate::history::History;
 
 /// One-shot text snapshot for scripts, cron logs, and parser verification.
 pub fn print_once(h: &History, peaks: &mut derive::Peaks) -> Result<()> {
-    let d = derive::derive(h, 2)
-        .ok_or_else(|| anyhow::anyhow!("no data scraped yet"))?;
+    let d = derive::derive(h, 2).ok_or_else(|| anyhow::anyhow!("no data scraped yet"))?;
     derive::update_peaks(peaks, h);
     print_snapshot(&d, peaks);
     Ok(())
 }
 
 fn tok(v: Option<f64>) -> String {
-    v.map(|v| format!("{v:.0} tok/s")).unwrap_or_else(|| "—".into())
+    v.map(|v| format!("{v:.0} tok/s"))
+        .unwrap_or_else(|| "—".into())
 }
 
 fn secs(v: Option<f64>) -> String {
@@ -25,13 +25,18 @@ fn secs(v: Option<f64>) -> String {
 }
 
 fn pct(v: Option<f64>) -> String {
-    v.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "—".into())
+    v.map(|v| format!("{:.0}%", v * 100.0))
+        .unwrap_or_else(|| "—".into())
 }
 
 fn pool_value(p: &derive::Pool) -> String {
     match (p.used, p.total) {
         (Some(u), Some(t)) if t > 0.0 => {
-            let counts = format!("{} / {}", crate::ui::fmt_tokens(u), crate::ui::fmt_tokens(t));
+            let counts = format!(
+                "{} / {}",
+                crate::ui::fmt_tokens(u),
+                crate::ui::fmt_tokens(t)
+            );
             if p.unit == "slots" {
                 format!("{} ({} slots)", pct(Some(p.usage)), counts)
             } else {
@@ -107,7 +112,11 @@ fn print_snapshot(d: &Derived, peaks: &derive::Peaks) {
     println!(
         "stalls: {} × {:.1}s in {} · evict/s {} · retract/s {} · 503/s {}",
         s.count,
-        if s.count > 0 { s.seconds / s.count as f64 } else { 0.0 },
+        if s.count > 0 {
+            s.seconds / s.count as f64
+        } else {
+            0.0
+        },
         WIN_LABELS[f],
         num(d.evict_rate),
         num(d.retract_rate),

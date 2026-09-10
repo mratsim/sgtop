@@ -11,9 +11,11 @@ use sgtop::scrape::Shared;
 use sgtop::ui::{draw, Overlay, Ui};
 
 fn shared_with_fixture() -> Arc<Shared> {
-    let body =
-        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/live.txt"))
-            .unwrap();
+    let body = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/live.txt"
+    ))
+    .unwrap();
     let shared = Shared {
         history: Mutex::new(History::default()),
         last_ok: Mutex::new(Some(Instant::now())),
@@ -131,7 +133,13 @@ fn error_banner_renders_when_stale() {
     let mut out = String::new();
     for row in 0..30 {
         for col in 0..120 {
-            out.push(terminal.backend().buffer()[(col, row)].symbol().chars().next().unwrap_or(' '));
+            out.push(
+                terminal.backend().buffer()[(col, row)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
         }
         out.push('\n');
     }
@@ -153,11 +161,20 @@ fn narrow_full_layout_truncates_with_ellipsis() {
     let mut out = String::new();
     for row in 0..30 {
         for col in 0..76 {
-            out.push(terminal.backend().buffer()[(col, row)].symbol().chars().next().unwrap_or(' '));
+            out.push(
+                terminal.backend().buffer()[(col, row)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
         }
         out.push('\n');
     }
-    assert!(out.contains('\u{2026}'), "expected truncated lines with ellipsis:\n{out}");
+    assert!(
+        out.contains('\u{2026}'),
+        "expected truncated lines with ellipsis:\n{out}"
+    );
     // no line may overflow its panel border (wrap would have pushed content down)
     assert!(out.contains("Answer quality"));
     assert!(out.contains("Health & trouble"));

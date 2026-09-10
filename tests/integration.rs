@@ -5,13 +5,20 @@ use sgtop::history::{quantile_from_buckets, History};
 use sgtop::metrics::{parse, Sample, SeriesKey};
 
 fn fixture() -> String {
-    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/live.txt")).unwrap()
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/live.txt"
+    ))
+    .unwrap()
 }
 
 fn key(name: &str, labels: &[(&str, &str)]) -> SeriesKey {
     SeriesKey {
         name: name.into(),
-        labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        labels: labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
     }
 }
 
@@ -51,14 +58,21 @@ fn parses_live_fixture() {
     assert_eq!(itl.counts.last().unwrap(), &(expected_count as f64));
 
     // every # HELP family must have produced at least one series
-    let help_count = fixture().lines().filter(|l| l.starts_with("# HELP")).count();
+    let help_count = fixture()
+        .lines()
+        .filter(|l| l.starts_with("# HELP"))
+        .count();
     let families: std::collections::BTreeSet<&str> = s
         .simple
         .keys()
         .chain(s.hist.keys())
         .map(|k| k.name.as_str())
         .collect();
-    assert_eq!(families.len(), help_count, "parsed families must match HELP count");
+    assert_eq!(
+        families.len(),
+        help_count,
+        "parsed families must match HELP count"
+    );
 }
 
 #[test]
@@ -119,7 +133,7 @@ fn window_quantile_falls_back_when_sparse() {
         m:lat_count 20\nm:lat_sum 5.0\n";
     h.push(t0, parse(body));
     h.push(t0 + Duration::from_secs(1), parse(body)); // identical -> zero new observations
-    // sparse (<5 observations in window) -> snapshot fallback must kick in
+                                                      // sparse (<5 observations in window) -> snapshot fallback must kick in
     let q = h.hist_quantile(|k| k.name == "m:lat", 0.5, Duration::from_secs(60));
     let snapshot = h.hist_snapshot_quantile(&|k: &SeriesKey| k.name == "m:lat", 0.5);
     assert_eq!(q, snapshot);
@@ -149,7 +163,10 @@ fn stall_signature_detected() {
     h.push(t0 + Duration::from_secs(3), mix(42.0, 200.0));
     let d = derive(&h, 0).unwrap();
     let stalls = d.stalls[0]; // 5s window
-    assert!(stalls.count >= 1, "expected stall detection, got {stalls:?}");
+    assert!(
+        stalls.count >= 1,
+        "expected stall detection, got {stalls:?}"
+    );
     assert!(stalls.seconds > 0.0, "stall seconds must be positive");
 
     let mut h = History::default();
@@ -181,7 +198,7 @@ fn session_peaks_accumulate_and_reset_on_restart() {
     update_peaks(&mut peaks, &h);
     assert_eq!(peaks.decode, Some(140.0)); // 240-100 over the last 1s
     assert_eq!(peaks.prefill, Some(500.0)); // first interval 0->500 beats 400
-    // single = 140 decode / 4 running
+                                            // single = 140 decode / 4 running
     assert_eq!(peaks.decode_single, Some(35.0));
 
     // lower follow-up intervals must not lower the peaks
@@ -196,4 +213,41 @@ fn session_peaks_accumulate_and_reset_on_restart() {
     assert_eq!(peaks.decode, None);
     assert_eq!(peaks.prefill, None);
     assert_eq!(peaks.decode_single, None);
+}
+
+#[test]
+fn histogram_bucket_without_le_is_skipped_not_fatal() {
+    let body = "\
+# TYPE m:lat histogram
+m:lat_count{mode=\"decode\"} 2
+m:lat_bucket{mode=\"decode\"} 1
+m:lat_bucket{mode=\"decode\",le=\"10\"} 2
+m:other_gauge 7
+";
+    let sample = parse(body);
+    let key = key("m:lat", &[("mode", "decode")]);
+    let h = sample.hist.get(&key).expect("histogram family present");
+    // only the bucket with a usable `le` survives
+    assert_eq!(h.le, vec![10.0]);
+    assert_eq!(h.counts, vec![2.0]);
+    assert_eq!(h.count, 2);
+    assert_eq!(sample.simple.len(), 1);
+}
+
+#[test]
+fn interval_rejects_non_finite() {
+    use clap::Parser as _;
+    use sgtop::args::Args as _Args;
+    for bad in ["nan", "NaN", "inf", "-inf", "infinity"] {
+        let res = _Args::try_parse_from(["sgtop", &format!("--interval={bad}")]);
+        assert!(res.is_err(), "--interval {bad} must be rejected");
+        let msg = format!("{}", res.unwrap_err().render());
+        assert!(msg.contains("finite"), "error for {bad}: {msg}");
+    }
+    for ok in ["0.5", "10", "1.5"] {
+        assert!(
+            _Args::try_parse_from(["sgtop", "--interval", ok]).is_ok(),
+            "--interval {ok} must be accepted"
+        );
+    }
 }
