@@ -57,21 +57,53 @@ fn parses_live_fixture() {
     assert!(itl.le.last().unwrap().is_infinite());
     assert_eq!(itl.counts.last().unwrap(), &(expected_count as f64));
 
-    // every # HELP family must have produced at least one series
-    let help_count = fixture()
+    // series must exist for every # HELP family carrying readable data.
+    // a family whose every record holds a non-finite value is no data:
+    // it parses to no series, and the UI renders the missing marker
+    // rather than a maximal value
+    let mut family_has_finite_record: std::collections::BTreeMap<String, bool> = Default::default();
+    for l in fixture().lines() {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let name = l
+            .split('{')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let base = name
+            .strip_suffix("_bucket")
+            .or_else(|| name.strip_suffix("_sum"))
+            .or_else(|| name.strip_suffix("_count"))
+            .unwrap_or(name);
+        let finite = l
+            .split_whitespace()
+            .last()
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|v| v.is_finite());
+        *family_has_finite_record
+            .entry(base.to_string())
+            .or_insert(false) |= finite;
+    }
+    let expected: std::collections::BTreeSet<String> = fixture()
         .lines()
         .filter(|l| l.starts_with("# HELP"))
-        .count();
-    let families: std::collections::BTreeSet<&str> = s
+        .filter_map(|l| l.split_whitespace().nth(2))
+        .filter(|fam| family_has_finite_record.get(*fam).copied().unwrap_or(true))
+        .map(String::from)
+        .collect();
+    let families: std::collections::BTreeSet<String> = s
         .simple
         .keys()
         .chain(s.hist.keys())
-        .map(|k| k.name.as_str())
+        .map(|k| k.name.clone())
         .collect();
     assert_eq!(
-        families.len(),
-        help_count,
-        "parsed families must match HELP count"
+        families, expected,
+        "parsed families must match the HELP families carrying readable data"
     );
 }
 
@@ -401,4 +433,183 @@ fn interval_rejects_non_finite() {
             "--interval {ok} must be accepted"
         );
     }
+}
+
+// ---- display hardening: non-finite gauges, pool visibility ----
+
+fn mamba_pool_sample(usage: Option<f64>) -> Sample {
+    let usage_line = match usage {
+        Some(v) => format!("sglang:mamba_usage {v}\n"),
+        None => String::new(),
+    };
+    parse(&format!(
+        "# TYPE sglang:mamba_used_tokens gauge\n\
+         sglang:mamba_used_tokens 8.0\n\
+         # TYPE sglang:mamba_available_tokens gauge\n\
+         sglang:mamba_available_tokens 8.0\n\
+         # TYPE sglang:mamba_usage gauge\n\
+         {usage_line}"
+    ))
+    .unwrap()
+}
+
+// NaN and ±Inf gauge values are unreadable data, not extreme readings:
+// skip the record like any other malformed line, leaving the series
+// absent so consumers see no data, never a maximal-looking value.
+#[test]
+fn non_finite_gauge_values_read_as_no_data() {
+    let body = "# TYPE m:g gauge\n\
+                m:g NaN\n\
+                m:g{r=\"0\"} +Inf\n\
+                m:g{r=\"1\"} -Inf\n\
+                m:g{r=\"2\"} 7.0\n";
+    let s = parse(body).unwrap();
+    assert_eq!(
+        s.gauge("m:g"),
+        Some(7.0),
+        "only the finite reading may survive"
+    );
+    assert_eq!(s.simple.len(), 1);
+}
+
+// A NaN reading inside a windowed series must produce the same derived
+// shape as the series being absent altogether: same gauge lookup,
+// same pool membership, same graph lane.
+#[test]
+fn nan_reading_in_a_windowed_series_has_the_shape_of_a_missing_sample() {
+    let t0 = Instant::now();
+    let mut h_nan = History::default();
+    h_nan.push(t0, mamba_pool_sample(Some(0.5)));
+    h_nan.push(
+        t0 + Duration::from_secs(1),
+        mamba_pool_sample(Some(f64::NAN)),
+    );
+    let mut h_missing = History::default();
+    h_missing.push(t0, mamba_pool_sample(Some(0.5)));
+    h_missing.push(t0 + Duration::from_secs(1), mamba_pool_sample(None));
+
+    let usage = |k: &SeriesKey| k.name == "sglang:mamba_usage";
+    assert_eq!(
+        h_nan.gauge_pred(usage),
+        h_missing.gauge_pred(usage),
+        "a non-finite reading must not look like a present value"
+    );
+
+    let d_nan = derive(&h_nan, 0).unwrap();
+    let d_missing = derive(&h_missing, 0).unwrap();
+    assert_eq!(
+        d_nan.pools.len(),
+        d_missing.pools.len(),
+        "pool membership must match the absent-series case"
+    );
+    assert_eq!(
+        d_nan.graphs.pool_mamba, d_missing.graphs.pool_mamba,
+        "pool graph lane must match the absent-series case"
+    );
+}
+
+// A completely full optional pool (zero available slots, all used) has
+// data and must keep rendering at exactly 100% usage.
+#[test]
+fn optional_pool_at_exactly_full_capacity_still_renders() {
+    let body = "\
+# TYPE sglang:mamba_used_tokens gauge
+sglang:mamba_used_tokens 16.0
+# TYPE sglang:mamba_available_tokens gauge
+sglang:mamba_available_tokens 0.0
+# TYPE sglang:mamba_usage gauge
+sglang:mamba_usage 1.0
+# TYPE sglang:swa_used_tokens gauge
+sglang:swa_used_tokens 16.0
+# TYPE sglang:swa_available_tokens gauge
+sglang:swa_available_tokens 0.0
+# TYPE sglang:swa_token_usage gauge
+sglang:swa_token_usage 1.0
+";
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, parse(body).unwrap());
+    h.push(t0 + Duration::from_secs(1), parse(body).unwrap());
+    let d = derive(&h, 0).unwrap();
+    let mamba = d
+        .pools
+        .iter()
+        .find(|p| p.name == "mamba")
+        .expect("full mamba pool must keep rendering");
+    assert_eq!(mamba.usage, 1.0);
+    let swa = d
+        .pools
+        .iter()
+        .find(|p| p.name == "SWA")
+        .expect("full SWA pool must keep rendering");
+    assert_eq!(swa.usage, 1.0);
+}
+
+// The visibility gate is "ever had data", not "ever existed": a pool
+// reporting zero capacity and zero usage stays hidden.
+#[test]
+fn optional_pool_that_never_had_data_stays_hidden() {
+    let body = "\
+# TYPE sglang:mamba_used_tokens gauge
+sglang:mamba_used_tokens 0.0
+# TYPE sglang:mamba_available_tokens gauge
+sglang:mamba_available_tokens 0.0
+# TYPE sglang:mamba_usage gauge
+sglang:mamba_usage 0.0
+";
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, parse(body).unwrap());
+    h.push(t0 + Duration::from_secs(1), parse(body).unwrap());
+    let d = derive(&h, 0).unwrap();
+    assert!(
+        d.pools.iter().all(|p| p.name != "mamba"),
+        "a pool with no data in the window must stay hidden"
+    );
+}
+
+// A usage-ratio gauge that blinks non-finite mid-window must not hide
+// a pool that has reported data: visibility follows the ever-had-data
+// rule, and the usage shown falls back to the latest in-window reading.
+#[test]
+fn pool_stays_visible_when_its_usage_gauge_blinks_non_finite() {
+    let t0 = Instant::now();
+    let live = "\
+# TYPE sglang:mamba_used_tokens gauge
+sglang:mamba_used_tokens 4.0
+# TYPE sglang:mamba_available_tokens gauge
+sglang:mamba_available_tokens 4.0
+# TYPE sglang:mamba_usage gauge
+sglang:mamba_usage 0.5
+";
+    let blink = live.replace("sglang:mamba_usage 0.5", "sglang:mamba_usage NaN");
+
+    // blink while the counts stay present in the newest scrape:
+    // the usage shown is the computed used/total ratio
+    let mut h_blink = History::default();
+    h_blink.push(t0, parse(live).unwrap());
+    h_blink.push(t0 + Duration::from_secs(1), parse(&blink).unwrap());
+    let d_blink = derive(&h_blink, 0).unwrap();
+    let mamba = d_blink
+        .pools
+        .iter()
+        .find(|p| p.name == "mamba")
+        .expect("a pool with in-window data must keep rendering through a usage-gauge blink");
+    assert_eq!(mamba.usage, 0.5, "usage must come from the computed ratio");
+
+    // blink with the newest scrape carrying no mamba gauges at all:
+    // the usage shown is the latest in-window usage reading
+    let absent = "# TYPE sglang:num_running_reqs gauge\nsglang:num_running_reqs 1.0\n";
+    let mut h_absent = History::default();
+    h_absent.push(t0, parse(live).unwrap());
+    h_absent.push(t0 + Duration::from_secs(1), parse(absent).unwrap());
+    let d_absent = derive(&h_absent, 0).unwrap();
+    let mamba_absent =
+        d_absent.pools.iter().find(|p| p.name == "mamba").expect(
+            "a pool with in-window data must keep rendering when the newest scrape omits it",
+        );
+    assert_eq!(
+        mamba_absent.usage, 0.5,
+        "usage must fall back to the prior in-window reading"
+    );
 }

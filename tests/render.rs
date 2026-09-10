@@ -36,6 +36,29 @@ fn shared_with_fixture() -> Arc<Shared> {
     Arc::new(shared)
 }
 
+// History seeded from explicit payloads one scrape apart, for tests
+// needing a custom latest sample.
+fn shared_with_bodies(bodies: &[String]) -> Arc<Shared> {
+    let shared = Shared {
+        history: Mutex::new(History::default()),
+        last_ok: Mutex::new(Some(Instant::now())),
+        last_error: Mutex::new(None),
+        paused: AtomicBool::new(false),
+        interval_ms: std::sync::atomic::AtomicU64::new(1000),
+        peaks: Mutex::new(sgtop::derive::Peaks::default()),
+    };
+    let mut h = shared.history.lock().unwrap();
+    let t0 = Instant::now();
+    for (i, body) in bodies.iter().enumerate() {
+        h.push(
+            t0 + std::time::Duration::from_secs(i as u64),
+            parse(body).unwrap(),
+        );
+    }
+    drop(h);
+    Arc::new(shared)
+}
+
 fn render_at(cols: u16, rows: u16, overlay: Overlay) -> String {
     let shared = shared_with_fixture();
     let backend = TestBackend::new(cols, rows);
@@ -219,4 +242,45 @@ fn narrow_full_layout_truncates_with_ellipsis() {
 fn debug_print_wide() {
     let out = render_at(230, 45, Overlay::None);
     println!("=====\n{out}\n=====");
+}
+
+// A non-finite gauge reading is no data: the UI renders the missing marker,
+// never a "NaN" percentage or a maximal-looking bar.
+#[test]
+fn non_finite_gauge_reading_renders_as_no_data() {
+    let fixture = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/live.txt"
+    ))
+    .unwrap();
+    for reading in ["NaN", "+Inf", "-Inf"] {
+        // newest scrape carries a non-finite cache-hit reading
+        // where the fixture has a finite one
+        let stale = format!(
+            "{}\nsglang:cache_hit_rate{{engine_type=\"unified\",model_name=\"glm-5.3-flash\",\
+             moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"}} {reading}\n",
+            fixture
+        );
+        let shared = shared_with_bodies(&[fixture.clone(), stale]);
+        let backend = TestBackend::new(120, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &ui_default(), &shared)).unwrap();
+        let mut out = String::new();
+        for row in 0..30 {
+            for col in 0..120 {
+                out.push(
+                    terminal.backend().buffer()[(col, row)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' '),
+                );
+            }
+            out.push('\n');
+        }
+        assert!(
+            !out.contains("NaN"),
+            "a {reading} reading must render as no data, got:\n{out}"
+        );
+    }
 }

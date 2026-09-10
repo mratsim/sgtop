@@ -433,8 +433,9 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
         ),
     ];
 
-    // pools: KV always; mamba/SWA render once the engine has shown a live
-    // pool in this session (sticky, so idle lapses don't make rows vanish)
+    // pools: KV always, mamba/SWA once the engine has reported pool data
+    // inside the 60s window (sticky, so idle lapses within the window
+    // don't make rows vanish)
     let mut pools = Vec::new();
     if let Some(u) = h.gauge_pred(fam("sglang:token_usage")) {
         // logical capacity: max_total_num_tokens is exported per rank
@@ -458,27 +459,37 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
             unit: "tokens",
         });
     }
-    let ever_live = |avail: &'static str, usage: &'static str| -> Option<f64> {
-        // stickiness: present if the pool had capacity at any point in the
-        // 60s window; value is the latest usage
-        let ever = h
-            .window_entries(WINDOWS[2])
-            .iter()
-            .any(|e| e.sample.gauge(avail).unwrap_or(0.0) > 0.0);
-        if ever {
-            h.gauge_pred(fam(usage))
-        } else {
-            None
-        }
-    };
-    if let Some(u) = ever_live("sglang:mamba_available_tokens", "sglang:mamba_usage") {
+    let ever_live =
+        |avail: &'static str, used: &'static str, usage: &'static str| -> (bool, Option<f64>) {
+            // qualifying data is a nonzero available or used reading:
+            // a pool at exactly 100% (zero available) still qualifies.
+            let ever = h.window_entries(WINDOWS[2]).iter().any(|e| {
+                e.sample.gauge(avail).unwrap_or(0.0) > 0.0
+                    || e.sample.gauge(used).unwrap_or(0.0) > 0.0
+            });
+            // the usage shown is the latest in-window reading of the usage gauge:
+            // the parse boundary drops non-finite values, so a NaN
+            // blink leaves the prior reading in place
+            let u = h
+                .window_entries(WINDOWS[2])
+                .iter()
+                .rev()
+                .find_map(|e| e.sample.gauge(usage));
+            (ever, u)
+        };
+    let (ever, u) = ever_live(
+        "sglang:mamba_available_tokens",
+        "sglang:mamba_used_tokens",
+        "sglang:mamba_usage",
+    );
+    if ever {
         let used = h.sum_gauge(fam("sglang:mamba_used_tokens"));
         let avail = h.sum_gauge(fam("sglang:mamba_available_tokens"));
         let total = used.zip(avail).map(|(u, a)| u + a);
         let usage = total
             .filter(|t| *t > 0.0)
             .map(|t| (used.unwrap_or(0.0) / t).clamp(0.0, 1.0))
-            .unwrap_or(u);
+            .unwrap_or(u.unwrap_or(0.0));
         pools.push(Pool {
             name: "mamba",
             usage,
@@ -487,14 +498,19 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
             unit: "slots",
         });
     }
-    if let Some(u) = ever_live("sglang:swa_available_tokens", "sglang:swa_token_usage") {
+    let (ever, u) = ever_live(
+        "sglang:swa_available_tokens",
+        "sglang:swa_used_tokens",
+        "sglang:swa_token_usage",
+    );
+    if ever {
         let used = h.sum_gauge(fam("sglang:swa_used_tokens"));
         let avail = h.sum_gauge(fam("sglang:swa_available_tokens"));
         let total = used.zip(avail).map(|(u, a)| u + a);
         let usage = total
             .filter(|t| *t > 0.0)
             .map(|t| (used.unwrap_or(0.0) / t).clamp(0.0, 1.0))
-            .unwrap_or(u);
+            .unwrap_or(u.unwrap_or(0.0));
         pools.push(Pool {
             name: "SWA",
             usage,

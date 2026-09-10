@@ -139,6 +139,13 @@ pub fn parse(body: &str) -> anyhow::Result<Sample> {
             Some(v) => v,
             None => continue,
         };
+        // NaN and ±Inf gauge values are unreadable data, never extreme readings:
+        // skip the record like any other malformed line, leaving the series
+        // absent, so gauges, pools, and graph lanes see no data,
+        // never a maximal-looking value
+        if !value.is_finite() {
+            continue;
+        }
 
         let labels = label_src.map(parse_labels).unwrap_or_default();
 
