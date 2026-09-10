@@ -623,11 +623,11 @@ fn draw_rate_graph(
             Style::new().fg(color).add_modifier(Modifier::BOLD),
         ),
     ]);
-    // the decode title adds the window's per-stream stats: the mean
-    // and the max of the single-stream series, the stable numbers
-    // under the spiky instant rate
-    let title = match which {
-        RateGraph::Prefill => title,
+    // the decode legend line gains the window's per-stream stats:
+    // mean and max of the single-stream series join the legend
+    // on the bottom border, keeping the top title short on laptops
+    let sub = match which {
+        RateGraph::Prefill => sub,
         RateGraph::Decode => {
             let (sum, peak, n) = g
                 .per_stream
@@ -636,18 +636,17 @@ fn draw_rate_graph(
                 .fold((0.0_f64, 0.0_f64, 0_usize), |(s, p, n), v| {
                     (s + v, p.max(v), n + 1)
                 });
-            let mut spans = title.spans;
+            let mut spans = match sub {
+                Some(line) => line.spans,
+                None => Vec::new(),
+            };
             if n > 0 {
                 spans.push(Span::styled(
-                    format!(
-                        "\u{b7} per-stream avg {:.0} \u{b7} per-stream peak {:.0} ",
-                        sum / n as f64,
-                        peak
-                    ),
+                    format!(" \u{b7} avg {:.0} \u{b7} peak {:.0} ", sum / n as f64, peak),
                     Style::new().fg(t.s3).add_modifier(Modifier::BOLD),
                 ));
             }
-            Line::from(spans)
+            Some(Line::from(spans))
         }
     };
     let block = block_titled(t, title, sub);
