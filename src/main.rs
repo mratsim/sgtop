@@ -23,6 +23,9 @@ fn main() -> Result<()> {
             let body = scrape::fetch_once(&url, args.api_key.as_deref(), args.insecure)?;
             h.push(Instant::now(), metrics::parse(&body)?);
         }
+        if args.insecure {
+            println!("\u{26a0} insecure TLS: the bearer token and metrics transit unverified");
+        }
         let mut peaks = sgtop::derive::Peaks::default();
         sgtop::once::print_once(&h, &mut peaks)?;
         return Ok(());

@@ -27,6 +27,8 @@ pub struct Ui {
     pub graphs_on: bool,
     pub window_focus: usize,
     pub paused_since: Option<Instant>,
+    /// `--insecure` is active: flagged in the header so unverified TLS is visible
+    pub insecure: bool,
     pub overlay: Overlay,
     pub scroll: u16,
     pub interval: f64,
@@ -51,6 +53,7 @@ impl Ui {
             graphs_on: true,
             window_focus: 2,
             paused_since: None,
+            insecure: args.insecure,
             overlay: Overlay::None,
             scroll: 0,
             interval: args.interval.clamp(0.5, 10.0),
@@ -310,6 +313,12 @@ fn draw_header(
         format!(" · poll {:.1}s", ui.interval),
         Style::new().fg(t.dim),
     ));
+    if ui.insecure {
+        spans.push(Span::styled(
+            " · \u{26a0} insecure TLS",
+            Style::new().fg(t.warn),
+        ));
+    }
     if let Some(a) = age {
         if a > Duration::from_secs(2) {
             spans.push(Span::styled(
@@ -620,7 +629,7 @@ fn draw_right_graphs(
         t,
         Line::from(title_spans),
         Some(Line::from(Span::styled(
-            " KV/mamba full = requests wait · host full is normal (it recycles old entries — see evictions/s) ".to_string(),
+            " KV/mamba full = requests wait · host full is normal (it recycles its own old entries) ".to_string(),
             Style::new().fg(t.dim),
         ))),
     );
@@ -1102,7 +1111,7 @@ fn health_col_kvs(d: Option<&Derived>, focus: usize, t: &Theme) -> Vec<Kv> {
         h.push(Kv::colored(
             "evictions/s",
             fmt_num(d.evict_rate),
-            "finished work thrown out early — memory pressure",
+            "device KV cache slots freed to make room",
             trouble_color(t, d.evict_rate),
         ));
         h.push(Kv::colored(
@@ -1120,7 +1129,7 @@ fn health_col_kvs(d: Option<&Derived>, focus: usize, t: &Theme) -> Vec<Kv> {
         h.push(Kv::colored(
             "l2 drop/s",
             fmt_num(d.l2_drop),
-            "host-tier tokens evicted before reuse",
+            "device tokens destroyed without a host backup",
             trouble_color(t, d.l2_drop),
         ));
         h.push(Kv::plain(
@@ -1428,7 +1437,7 @@ fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
         ("space", "pause scraping (for staring & screenshots)"),
         ("c", "toggle compact / full layout"),
         ("g", "toggle graphs"),
-        ("1 2 3", "graphs follow the 5s / 15s / 60s window"),
+        ("1 2 3", "focus the 5s / 15s / 60s window"),
         ("t", "cycle theme"),
         ("e", "plain-language tour of every panel"),
         ("+ / -", "poll interval (faster / slower)"),
@@ -1495,11 +1504,11 @@ fn draw_explain(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect) {
     section("p50 / p95 / p99", "p50 is a typical request. p95 is the experience of the unluckiest 1-in-20. p99 is the worst moments. If p50 is fine but p95 is bad, most people are happy but some are having a bad time — that gap is the number to watch.\n\nThe 5s/15s/60s columns are a fresh p95 of just that window's requests — nothing is averaged with the past, so a single slow request shows up in the 5s column immediately. Bigger windows move slower only because they cover more requests.", &mut lines);
     section("Waiting line (queue)", "Requests that arrived but have not started. A short, spiky line is normal. A tall, flat line means the server is overloaded and everyone's wait grows.", &mut lines);
     section("Peaks", "The Peak box holds the highest rates seen since sgtop started: the busiest decode moment, the biggest prefill burst, and single — the fastest one stream has ever moved (total decode speed divided by how many requests were sharing it).", &mut lines);
-    section("Memory pools", "The model keeps working memory for every conversation in progress (KV), and optionally for alternative memory types (mamba, SWA). At 100% a pool is full: new requests wait, and the server may throw out or restart old ones (see evictions and retractions).\n\nThe host tier is the exception: it is a large CPU-RAM cache of prompt prefixes that stays pinned near 100% in normal operation and recycles the oldest entries when it needs room (that is the evictions/s counter). A full host tier is not a problem — only KV or mamba running full is.", &mut lines);
+    section("Memory pools", "The model keeps working memory for every conversation in progress (KV), and optionally for alternative memory types (mamba, SWA). At 100% a pool is full: new requests wait, and the server may throw out or restart old ones (see evictions and retractions).\n\nThe host tier is the exception: it is a large CPU-RAM cache of prompt prefixes that stays pinned near 100% in normal operation and recycles the oldest entries when it needs room. A full host tier is not a problem — only KV or mamba running full is. The evictions/s counter belongs to the device KV cache, not the host tier.", &mut lines);
     section("Stalls", "A stall is a moment when every stream froze because a prompt was being read. Measured as how many times it happened and how many seconds in total over the window.", &mut lines);
-    section("Cache hit & the L2 tiers", "How much of each new prompt the server already remembers from earlier turns. High cache hit = fast starts and less work. A sudden drop usually means a restart or very different traffic.\n\nLarge servers often keep a second, bigger cache tier in host RAM (the \"host\" pool). The l2 dev\u{b7}host line shows how much of the recent prefill work was served from the GPU-resident tier vs the host tier; wb\u{b7}rb is how many tokens per second are being written down to, or read back from, that tier. l2 drop/s counts tokens the host tier threw away before they could be reused \u{2014} it should be zero.", &mut lines);
+    section("Cache hit & the L2 tiers", "How much of each new prompt the server already remembers from earlier turns. High cache hit = fast starts and less work. A sudden drop usually means a restart or very different traffic.\n\nLarge servers often keep a second, bigger cache tier in host RAM (the \"host\" pool). The l2 dev\u{b7}host line shows how much of the recent prefill work was served from the GPU-resident tier vs the host tier; wb\u{b7}rb is how many tokens per second are being written down to, or read back from, that tier. l2 drop/s counts device tokens destroyed without a host backup \u{2014} work the host tier failed to save; it should be zero.", &mut lines);
     section("Speculative accept", "The model tries to guess several words ahead and checks them in one go. Accept rate is how often the guesses are right; accept length is how many words each lucky guess saves. High numbers make everything feel faster.", &mut lines);
-    section("Retractions & evictions", "A retraction means a running request was abandoned and restarted — its user watched their answer reset. Evictions throw cached work away early. Both should sit at zero; anything else is memory pressure.", &mut lines);
+    section("Retractions & evictions", "A retraction means a running request was abandoned and restarted — its user watched their answer reset. Evictions free device KV cache slots to make room; the freed prefixes may already be backed up to the host tier, so steady recycling is normal while a spike means memory pressure. l2 drop/s is the harmful one: device tokens destroyed without a host backup, work truly lost.", &mut lines);
 
     f.render_widget(Paragraph::new(lines).scroll((ui.scroll, 0)), inner);
 }

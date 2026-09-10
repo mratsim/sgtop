@@ -116,6 +116,41 @@ fn tiny_terminal_does_not_panic() {
 }
 
 #[test]
+fn insecure_tls_hint_renders_only_when_enabled() {
+    let out = render_at(120, 30, Overlay::None);
+    assert!(
+        !out.contains("insecure TLS"),
+        "hint shown without --insecure"
+    );
+
+    let shared = shared_with_fixture();
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let ui = Ui {
+        insecure: true,
+        ..ui_default()
+    };
+    terminal.draw(|f| draw(f, &ui, &shared)).unwrap();
+    let mut out = String::new();
+    for row in 0..30 {
+        for col in 0..120 {
+            out.push(
+                terminal.backend().buffer()[(col, row)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
+        }
+        out.push('\n');
+    }
+    assert!(
+        out.contains("insecure TLS"),
+        "hint missing with --insecure:\n{out}"
+    );
+}
+
+#[test]
 fn debug_print_full() {
     let out = render_at(120, 30, Overlay::None);
     println!("=====\n{out}\n=====");

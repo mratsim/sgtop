@@ -111,7 +111,7 @@ pub struct Derived {
     /// host-tier traffic: tokens/s written back / read back
     pub l2_wb: Option<f64>,
     pub l2_rb: Option<f64>,
-    /// tokens/s dropped by the host tier (should be 0)
+    /// device KV tokens/s destroyed without a host backup (should be 0)
     pub l2_drop: Option<f64>,
     pub new_token_ratio: Option<f64>,
     /// average generation length (tokens) of currently running requests
