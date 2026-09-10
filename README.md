@@ -19,10 +19,12 @@ binary, no storage, no daemon.
 </p>
 
 <p align="center">
-  <img src="media/screenshot-stress.png" alt="(pre-revision UI) sgtop under
-  stress: queue non-empty, four stalls in 60s, mamba pool at 100% with the
-  memory-pool alarm lit, TTFT p95 in red, prefill bursts against the
-  1k-10k gridline ladder" width="100%">
+  <img src="media/screenshot-stress.png" alt="sgtop under stress: prefill
+  bursts near 10k tok/s while decode starves to zero, a red tick fence on
+  the decode canvas marking 27 freezes (28.7s frozen in 60s), the TTFT
+  plot in full red with its gridlines auto-scaled to 10s and 30s, queue
+  time p95 at 31s, evictions at 7.5k/s and the mamba pool pinned full"
+  width="100%">
 </p>
 
 ## Features
