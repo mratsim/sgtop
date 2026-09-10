@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 use sgtop::derive::{derive, WINDOWS};
-use sgtop::history::{quantile_from_buckets, History};
+use sgtop::history::{quantile_from_buckets, History, RING_CAP};
 use sgtop::metrics::{parse, Sample, SeriesKey, BUCKET_CAP, SERIES_CAP};
 
 fn fixture() -> String {
@@ -688,16 +688,16 @@ fn reappearance_intervals_are_exactly_those_after_an_absent_predecessor() {
     // nothing to sum, and the others keep their true deltas
     let expected = [10.0, 0.0, 0.0, 30.0];
     assert_eq!(
-        d.graphs.decode.len(),
+        d.graphs.decode.vals.len(),
         expected.len(),
         "decode lanes were {:?}",
-        d.graphs.decode
+        d.graphs.decode.vals
     );
-    for (i, (got, want)) in d.graphs.decode.iter().zip(expected.iter()).enumerate() {
+    for (i, (got, want)) in d.graphs.decode.vals.iter().zip(expected.iter()).enumerate() {
         assert!(
             (got - want).abs() < 1e-9,
             "decode lane {i} was {got}, expected {want} (lanes {:?})",
-            d.graphs.decode
+            d.graphs.decode.vals
         );
     }
 }
@@ -808,4 +808,168 @@ fn nan_le_bound_is_dropped_and_quantiles_stay_sane() {
         .hist_quantile(|k| k.name == "m:lat", 0.5, Duration::from_secs(60))
         .unwrap();
     assert!((p50 - 0.25).abs() < 1e-9, "p50 was {p50}");
+}
+
+// ---- unified stall pass: one flag set feeds the banner and the graphs ----
+
+/// One scrape of the stall fixture holding decode and prefill
+/// counters, a running gauge, and an optional helper counter `m:c`.
+/// A None decode reading means an absent series: the shape left
+/// behind when the parse boundary drops a non-finite value.
+fn stall_sample(decode: Option<f64>, prefill: f64, running: f64, helper: Option<f64>) -> Sample {
+    let mut body = String::from("# TYPE sglang:realtime_tokens_total counter\n");
+    if let Some(v) = decode {
+        body.push_str(&format!(
+            "sglang:realtime_tokens_total{{mode=\"decode\"}} {v}\n"
+        ));
+    }
+    body.push_str(&format!(
+        "sglang:realtime_tokens_total{{mode=\"prefill_compute\"}} {prefill}\n\
+         # TYPE sglang:num_running_reqs gauge\n\
+         sglang:num_running_reqs {running}\n\
+         # TYPE m:c counter\n"
+    ));
+    if let Some(v) = helper {
+        body.push_str(&format!("m:c {v}\n"));
+    }
+    parse(&body).unwrap()
+}
+
+fn stall_history(samples: &[Sample]) -> History {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    for (i, s) in samples.iter().enumerate() {
+        h.push(t0 + Duration::from_secs(i as u64), s.clone());
+    }
+    h
+}
+
+// The flagged tick positions are exactly the intervals whose predecessor
+// sample lacks the decode series. An unreadable or absent reading is itself a gap:
+// the interval leading out of it is flagged outright while prefill
+// is being computed. The hero counters fold the same flags into their time budgets,
+// so banner counts and graph ticks can never disagree.
+// A counter whose only advance lands on the flagged interval pairs
+// nothing across the gap (zero real rate, no fabricated spike).
+// One that moves between normal intervals shows its rate.
+#[test]
+fn stall_ticks_equal_intervals_whose_predecessor_is_absent() {
+    let samples = [
+        stall_sample(Some(0.0), 0.0, 4.0, Some(10.0)),
+        stall_sample(Some(100.0), 0.0, 4.0, Some(10.0)),
+        stall_sample(None, 0.0, 4.0, None),
+        stall_sample(Some(140.0), 50.0, 4.0, Some(90.0)),
+        stall_sample(Some(240.0), 50.0, 4.0, Some(90.0)),
+    ];
+    let absent = stall_history(&samples);
+    // a NaN reading is dropped at the parse boundary, so it must flag
+    // identically to the series being absent altogether
+    let nan = stall_history(&[
+        stall_sample(Some(0.0), 0.0, 4.0, Some(10.0)),
+        stall_sample(Some(100.0), 0.0, 4.0, Some(10.0)),
+        stall_sample(Some(f64::NAN), 0.0, 4.0, None),
+        stall_sample(Some(140.0), 50.0, 4.0, Some(90.0)),
+        stall_sample(Some(240.0), 50.0, 4.0, Some(90.0)),
+    ]);
+
+    for h in [&absent, &nan] {
+        let d = derive(h, 0).unwrap();
+        assert_eq!(
+            d.graphs.stall,
+            vec![false, false, true, false],
+            "flags must mark exactly the interval leading out of the unreadable scrape"
+        );
+        // the hero counters fold the same flags: one flagged interval
+        // inside each untruncated budget, one second frozen
+        assert_eq!(d.stalls[0].count, 1);
+        assert_eq!(d.stalls[2].count, 1);
+        assert!((d.stalls[2].seconds - 1.0).abs() < 1e-9);
+    }
+    assert_eq!(
+        derive(&absent, 0).unwrap().graphs.stall,
+        derive(&nan, 0).unwrap().graphs.stall,
+        "a non-finite blink and an absent series must flag identically"
+    );
+
+    // the helper counter's only advance lands on the flagged interval:
+    // the per-pair absence rule pairs nothing there, so the real rate is zero
+    // (measured stillness, not the fabricated jump across the gap)
+    let helper_rate = absent.rate_sum(|k| k.name == "m:c", Duration::from_secs(60));
+    assert_eq!(helper_rate, Some(0.0), "helper rate was {helper_rate:?}");
+    // decode moves between normal intervals and shows its rate: 200
+    // tokens over the 4s span
+    let decode_rate = absent
+        .rate_sum(
+            |k| k.name == "sglang:realtime_tokens_total" && k.has_label("mode", "decode"),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert!((decode_rate - 50.0).abs() < 1e-9, "rate was {decode_rate}");
+}
+
+// The stall bar is the median over the whole window, not the prefix
+// median at each interval: a collapse right at the start is flagged
+// by the graph ticks and the hero counters alike.
+#[test]
+fn stall_bar_is_the_full_window_median() {
+    let h = stall_history(&[
+        stall_sample(Some(0.0), 0.0, 4.0, None),
+        stall_sample(Some(0.0), 50.0, 4.0, None),
+        stall_sample(Some(100.0), 50.0, 4.0, None),
+        stall_sample(Some(200.0), 50.0, 4.0, None),
+    ]);
+    let d = derive(&h, 0).unwrap();
+    assert_eq!(d.graphs.stall, vec![true, false, false]);
+    assert_eq!(d.stalls[0].count, 1);
+}
+
+// Each interval is judged by the running count it had: a collapse
+// during an idle stretch is not flagged in hindsight by a later busy
+// reading.
+#[test]
+fn stall_flags_use_each_intervals_own_running_count() {
+    let h = stall_history(&[
+        stall_sample(Some(100.0), 0.0, 0.0, None),
+        stall_sample(Some(200.0), 0.0, 0.0, None),
+        stall_sample(Some(200.0), 60.0, 0.0, None),
+        stall_sample(Some(300.0), 60.0, 4.0, None),
+        stall_sample(Some(400.0), 60.0, 4.0, None),
+    ]);
+    let d = derive(&h, 0).unwrap();
+    assert_eq!(d.graphs.stall, vec![false, false, false, false]);
+    assert_eq!(d.stalls[0].count, 0);
+}
+
+// The cached window scan is rebuilt on every push, so the UI always
+// reads a scan matching the adjacent ring.
+#[test]
+fn cached_window_scan_tracks_the_ring() {
+    use sgtop::derive::scan_window;
+
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, stall_sample(Some(0.0), 0.0, 4.0, None));
+    assert!(h.scan().is_some(), "a push must populate the scan cache");
+    h.push(
+        t0 + Duration::from_secs(1),
+        stall_sample(Some(0.0), 50.0, 4.0, None),
+    );
+    h.push(
+        t0 + Duration::from_secs(2),
+        stall_sample(Some(100.0), 50.0, 4.0, None),
+    );
+    assert_eq!(h.scan().unwrap().stall, scan_window(&h).stall);
+    // eviction must not desynchronize the cache: pushing RING_CAP more
+    // samples evicts the oldest entries, and the cached scan still
+    // matches a fresh walk
+    for i in 0..(RING_CAP as u32) {
+        h.push(
+            t0 + Duration::from_secs(3 + i as u64),
+            stall_sample(Some(100.0 + f64::from(i)), 50.0, 4.0, None),
+        );
+    }
+    assert_eq!(
+        h.scan().unwrap().decode.vals.len(),
+        h.window_entries(Duration::from_secs(60)).len() - 1
+    );
 }

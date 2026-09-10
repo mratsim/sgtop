@@ -13,12 +13,24 @@ pub struct Entry {
     pub sample: Arc<Sample>,
 }
 
+/// Counter delta across one scrape pair: a reset (the new reading below the old one) counts as rising from zero.
+pub(crate) fn counter_delta(old: f64, new: f64) -> f64 {
+    if new < old {
+        new
+    } else {
+        new - old
+    }
+}
+
 /// Rolling in-memory buffer of recent scrapes. This is the tool's only
 /// "storage" — everything is discarded on exit.
 #[derive(Default)]
 pub struct History {
     buf: VecDeque<Entry>,
     pub first_seen: Option<Instant>,
+    /// Cached `derive::scan_window` output, rebuilt on every push.
+    /// `None` only before the first push.
+    scan: Option<crate::derive::Graphs>,
 }
 
 impl History {
@@ -38,6 +50,12 @@ impl History {
             t,
             sample: Arc::new(sample),
         });
+        self.scan = Some(crate::derive::scan_window(self));
+    }
+
+    /// See `derive::scan_window` for the pass this cache holds.
+    pub fn scan(&self) -> Option<&crate::derive::Graphs> {
+        self.scan.as_ref()
     }
 
     pub fn len(&self) -> usize {
@@ -93,12 +111,7 @@ impl History {
                 let Some(v_old) = pair[0].sample.simple.get(k) else {
                     continue;
                 };
-                let delta = if *v_new < *v_old {
-                    *v_new
-                } else {
-                    *v_new - *v_old
-                };
-                delta_sum += delta;
+                delta_sum += counter_delta(*v_old, *v_new);
                 any = true;
             }
         }

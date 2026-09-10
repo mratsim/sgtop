@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::history::History;
+use crate::history::{counter_delta, History};
 use crate::metrics::{Sample, SeriesKey};
 
 pub const WINDOWS: [Duration; 3] = [
@@ -57,12 +57,31 @@ pub struct Stalls {
     pub seconds: f64,
 }
 
-/// Per-scrape-interval series used to draw the 60s graphs.
+/// One rate lane over the trailing 60s window: one rate per scrape
+/// interval, with the interval's endpoint presence flags.
+#[derive(Clone, Default)]
+pub struct Lane {
+    /// Rate in the lane's unit (tokens/s) per scrape interval. An interval
+    /// whose series is missing from either endpoint sample pairs nothing
+    /// and reads 0: data absence, never a measured collapse.
+    pub vals: Vec<f64>,
+    /// The interval's earlier sample lacks the series: a first appearance,
+    /// a reappearance after an absence, or the return leg of a non-finite
+    /// reading dropped at the parse boundary. Recorded for both lanes:
+    /// every rate carries its gap provenance, and the stall fold consumes
+    /// the decode lane's flags.
+    pub absent_old: Vec<bool>,
+    /// The interval's later sample lacks the series: the absence starting.
+    pub absent_new: Vec<bool>,
+}
+
+/// The trailing 60s window in the shape the graphs draw, produced by one
+/// pass over the ring (`scan_window`) and cached next to it.
+#[derive(Clone, Default)]
 pub struct Graphs {
-    /// tokens/s per interval, one entry per scrape pair
-    pub decode: Vec<f64>,
-    pub prefill: Vec<f64>,
-    /// flagged intervals (prefill-stalls-decode signature)
+    pub decode: Lane,
+    pub prefill: Lane,
+    /// flagged intervals (see the stall definition on `scan_window`)
     pub stall: Vec<bool>,
     /// per-pool usage ratios (0–1) per scrape: KV / mamba / SWA / host
     pub pool_kv: Vec<f64>,
@@ -75,7 +94,9 @@ pub struct Graphs {
     pub dt: Vec<f64>,
 }
 
-/// Everything the UI needs, computed fresh for each render.
+/// Everything the UI needs for one draw: rates, quantiles, and pools
+/// computed per call, plus the graphs and stall flags from the cached
+/// per-push window scan (`History::scan`).
 pub struct Derived {
     pub model: String,
     pub engine: String,
@@ -143,55 +164,25 @@ fn latency_triple(h: &History, name: &'static str) -> LatencyTriple {
     out
 }
 
-/// Flag intervals where decode collapsed while a prefill was being computed
-/// and requests were running — the prefill-stalls-decode signature.
-fn detect_stalls(h: &History, running_now: f64) -> [Stalls; 3] {
-    let entries = h.window_entries(WINDOWS[2]);
+/// Fold the shared stall flags into the 5s/15s/60s time budgets: each
+/// window's trailing span counts the flagged intervals and their frozen
+/// seconds (the oldest interval may be cut off mid-way).
+fn fold_stalls(flags: &[bool], dt: &[f64]) -> [Stalls; 3] {
     let mut out = [Stalls::default(); 3];
-
-    // per-interval decode/prefill rates over the 60s window
-    let mut decode: Vec<f64> = Vec::new();
-    let mut prefill: Vec<f64> = Vec::new();
-    let mut dts: Vec<f64> = Vec::new();
-    for pair in entries.windows(2) {
-        let dt = (pair[1].t - pair[0].t).as_secs_f64();
-        if dt <= 0.0 {
-            continue;
-        }
-        decode.push(interval_rate(&pair[0].sample, &pair[1].sample, "decode") / dt);
-        prefill.push(interval_rate(&pair[0].sample, &pair[1].sample, "prefill_compute") / dt);
-        dts.push(dt);
-    }
-
-    let mut med: Vec<f64> = decode.clone();
-    med.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = match med.len() {
-        0 => return out,
-        n => med[n / 2],
-    };
-
-    let flags: Vec<bool> = decode
-        .iter()
-        .zip(prefill.iter())
-        .map(|(&d, &p)| d < 0.25 * median && running_now > 0.0 && p > 0.0)
-        .collect();
-
     for (i, w) in WINDOWS.iter().enumerate() {
-        // intervals within this window are the trailing ones whose total
-        // duration does not exceed w
         let mut budget = w.as_secs_f64();
         let mut count = 0u32;
         let mut seconds = 0.0;
-        for j in (0..dts.len()).rev() {
+        for j in (0..dt.len()).rev() {
             if budget <= 0.0 {
                 break;
             }
-            let take = dts[j].min(budget);
+            let take = dt[j].min(budget);
             if flags[j] {
                 count += 1;
                 seconds += take;
             }
-            budget -= dts[j];
+            budget -= dt[j];
         }
         out[i] = Stalls { count, seconds };
     }
@@ -272,21 +263,58 @@ fn interval_rate(old: &crate::metrics::Sample, new: &crate::metrics::Sample, mod
             let Some(v_old) = old.simple.get(k) else {
                 continue;
             };
-            delta += if *v_new < *v_old {
-                *v_new
-            } else {
-                *v_new - *v_old
-            };
+            delta += counter_delta(*v_old, *v_new);
         }
     }
     delta
 }
 
-fn build_graphs(h: &History) -> Graphs {
+impl Lane {
+    /// Append one scrape interval: the paired counter deltas over `dt`
+    /// become the rate, or 0 when the series is missing at one end.
+    fn push_interval(&mut self, old: &Sample, new: &Sample, mode: &str, dt: f64) {
+        let of_mode =
+            |k: &SeriesKey| k.name == "sglang:realtime_tokens_total" && k.has_label("mode", mode);
+        self.vals.push(interval_rate(old, new, mode) / dt);
+        self.absent_old.push(!old.simple.keys().any(of_mode));
+        self.absent_new.push(!new.simple.keys().any(of_mode));
+    }
+}
+
+/// One pass over the trailing 60s window, rebuilt once per scrape push,
+/// cached next to the ring (`History::scan`): per-series interval rates
+/// with their presence flags, the stall flags, and the graph lanes
+/// UI draws. Banner counters and red graph ticks read this shared
+/// pass, so no consumer re-derives stalls.
+///
+/// # Stall definition
+///
+/// An interval (a pair of consecutive ring samples) is stalled
+/// whenever the engine was working through it without producing
+/// decode output:
+///
+/// - window: the trailing 60s (`WINDOWS[2]`)
+/// - median over: the decode rate (tokens/s) of every interval, gaps
+///   included. The full-window median is the bar, so the window's busy
+///   level sets it
+/// - threshold: decode rate below 0.25 × that median, while the interval's
+///   later sample reports requests running and prefill was computing
+///   (a positive prefill rate)
+///
+/// Gaps: the parse boundary drops non-finite counter readings, so a NaN
+/// blink is a sample whose series is absent. Unreadable data is a gap,
+/// intended behavior rather than something to suppress. An interval
+/// leading out of such a sample pairs nothing (rate 0) and is flagged
+/// outright, and the running-count and prefill conditions still apply,
+/// so the red tick lands on the position of the unreadable sample.
+/// An interval where the absence starts (the later sample lacks the series) is not flagged: nothing measurable collapsed.
+/// The same per-pair absence rule drives the rate sums, so a counter
+/// that only moves across gap intervals shows a zero real rate.
+pub fn scan_window(h: &History) -> Graphs {
     let entries = h.window_entries(WINDOWS[2]);
-    let mut decode = Vec::new();
-    let mut prefill = Vec::new();
-    let mut stall = Vec::new();
+    let mut decode = Lane::default();
+    let mut prefill = Lane::default();
+    let mut running: Vec<f64> = Vec::new();
     let mut pool_kv = Vec::new();
     let mut pool_mamba = Vec::new();
     let mut pool_host = Vec::new();
@@ -299,17 +327,15 @@ fn build_graphs(h: &History) -> Graphs {
         if d <= 0.0 {
             continue;
         }
-        let dr = interval_rate(&pair[0].sample, &pair[1].sample, "decode") / d;
-        let pr = interval_rate(&pair[0].sample, &pair[1].sample, "prefill_compute") / d;
+        decode.push_interval(&pair[0].sample, &pair[1].sample, "decode", d);
+        prefill.push_interval(&pair[0].sample, &pair[1].sample, "prefill_compute", d);
         let running_at = pair[1]
             .sample
             .gauge("sglang:num_running_reqs")
             .unwrap_or(0.0);
-        decode.push(dr);
-        prefill.push(pr);
-        stall.push(dr < 0.25 * median_of(&decode) && running_at > 0.0 && pr > 0.0);
+        running.push(running_at);
         per_stream.push(if running_at > 0.0 {
-            Some(dr / running_at)
+            Some(decode.vals.last().copied().unwrap_or(0.0) / running_at)
         } else {
             None
         });
@@ -337,8 +363,8 @@ fn build_graphs(h: &History) -> Graphs {
         );
         pool_host.push(
             match (
-                pair[1].sample.gauge("sglang:hicache_host_total_tokens"),
-                pair[1].sample.gauge("sglang:hicache_host_used_tokens"),
+                s.gauge("sglang:hicache_host_total_tokens"),
+                s.gauge("sglang:hicache_host_used_tokens"),
             ) {
                 (Some(total), Some(used)) if total > 0.0 => used / total,
                 _ => 0.0,
@@ -359,6 +385,18 @@ fn build_graphs(h: &History) -> Graphs {
 
         dt.push(d);
     }
+
+    // the median bar spans the whole window, so the flags are set after
+    // the walk, as an arithmetic fold over the collected lanes
+    let median = median_of(&decode.vals);
+    let stall: Vec<bool> = (0..decode.vals.len())
+        .map(|i| {
+            running[i] > 0.0
+                && prefill.vals[i] > 0.0
+                && (decode.absent_old[i]
+                    || (!decode.absent_new[i] && decode.vals[i] < 0.25 * median))
+        })
+        .collect();
 
     Graphs {
         decode,
@@ -580,10 +618,10 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
     let prompt_len_p50 = h.hist_quantile(fam("sglang:prompt_tokens_histogram"), 0.50, WINDOWS[2]);
     let prompt_len_p95 = h.hist_quantile(fam("sglang:prompt_tokens_histogram"), 0.95, WINDOWS[2]);
 
-    let stalls = detect_stalls(h, running_now);
-    let graphs = build_graphs(h);
-    let decode_instant = graphs.decode.last().copied();
-    let prefill_instant = graphs.prefill.last().copied();
+    let graphs = h.scan().cloned()?;
+    let stalls = fold_stalls(&graphs.stall, &graphs.dt);
+    let decode_instant = graphs.decode.vals.last().copied();
+    let prefill_instant = graphs.prefill.vals.last().copied();
 
     let mut model = String::from("?");
     let mut engine = String::from("?");

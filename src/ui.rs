@@ -528,7 +528,7 @@ fn draw_rate_graph(
     let g = &d.graphs;
     let (vals, instant, color, title, gloss, sub, with_stalls) = match which {
         RateGraph::Prefill => (
-            &g.prefill,
+            &g.prefill.vals,
             d.prefill_instant,
             t.s2,
             "Prefill",
@@ -540,7 +540,7 @@ fn draw_rate_graph(
             false,
         ),
         RateGraph::Decode => (
-            &g.decode,
+            &g.decode.vals,
             d.decode_instant,
             t.s1,
             "Decode",

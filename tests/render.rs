@@ -29,9 +29,18 @@ fn shared_with_fixture() -> Arc<Shared> {
         }),
     };
     let mut h = shared.history.lock().unwrap();
-    // two samples so rates/graphs have a base
+    // two samples one scrape apart, the second with a distinct decode
+    // reading, so the graphs draw a real interval instead of a degenerate
+    // zero-duration, zero-delta sample
+    let bumped = body.replace(
+        "mode=\"decode\",model_name=\"glm-5.3-flash\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"} 114659.0",
+        "mode=\"decode\",model_name=\"glm-5.3-flash\",moe_ep_rank=\"0\",pp_rank=\"0\",tp_rank=\"0\"} 115059.0",
+    );
     h.push(Instant::now(), parse(&body).unwrap());
-    h.push(Instant::now(), parse(&body).unwrap());
+    h.push(
+        Instant::now() + std::time::Duration::from_secs(1),
+        parse(&bumped).unwrap(),
+    );
     drop(h);
     Arc::new(shared)
 }
