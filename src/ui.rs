@@ -611,7 +611,7 @@ fn draw_rate_graph(
                 "\u{2014} {} {:.0} \u{b7} peak {:.0} ",
                 match which {
                     RateGraph::Prefill => "now",
-                    RateGraph::Decode => "agg now",
+                    RateGraph::Decode => "aggregate now",
                 },
                 instant.unwrap_or(0.0),
                 scale
