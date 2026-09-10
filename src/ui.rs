@@ -585,7 +585,7 @@ fn draw_rate_graph(
                 Span::styled("\u{b7} ", Style::new().fg(t.dim)),
                 Span::styled(
                     "single-stream ",
-                    Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+                    Style::new().fg(t.s3).add_modifier(Modifier::BOLD),
                 ),
             ])),
         ),
@@ -640,7 +640,7 @@ fn draw_rate_graph(
                         sum / n as f64,
                         peak
                     ),
-                    Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+                    Style::new().fg(t.s3).add_modifier(Modifier::BOLD),
                 ));
             }
             Line::from(spans)
@@ -660,7 +660,7 @@ fn draw_rate_graph(
                 stall: &g.stall,
                 evict: None,
             }),
-            Some((g.per_stream.as_slice(), t.accent)),
+            Some((g.per_stream.as_slice(), t.s3)),
         ),
     };
     mini_line_graph(
@@ -1290,8 +1290,8 @@ fn health_col_kvs(
 }
 
 fn peaks_col_lines(peaks: &crate::derive::Peaks, t: &Theme) -> Vec<Line<'static>> {
-    // the single row carries the single-stream accent, matching the decode
-    // canvas's own single-stream line color
+    // the single row carries the single-stream s3 color, matching the
+    // decode canvas's own single-stream line color
     let pk = |label: &str, v: Option<f64>, color: ratatui::style::Color| {
         Line::from(vec![
             Span::styled(format!(" {label:<9}"), Style::new().fg(t.dim)),
@@ -1305,7 +1305,7 @@ fn peaks_col_lines(peaks: &crate::derive::Peaks, t: &Theme) -> Vec<Line<'static>
     let l = vec![
         pk("decode", peaks.decode, t.fg),
         pk("prefill", peaks.prefill, t.fg),
-        pk("single", peaks.decode_single, t.accent),
+        pk("single", peaks.decode_single, t.s3),
     ];
     l
 }
