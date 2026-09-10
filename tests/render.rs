@@ -293,3 +293,75 @@ fn non_finite_gauge_reading_renders_as_no_data() {
         );
     }
 }
+
+// The very first frame, before any scrape has landed, shows a stable
+// zero state: the panels and their placeholders draw without panic,
+// no graph is plotted from an empty ring, and no fabricated numbers
+// appear. Two consecutive frames must render identically.
+#[test]
+fn cold_start_frame_renders_a_stable_zero_state() {
+    let shared_for = || {
+        Arc::new(Shared {
+            history: Mutex::new(History::default()),
+            last_ok: Mutex::new(None),
+            last_error: Mutex::new(None),
+            paused: AtomicBool::new(false),
+            interval_ms: std::sync::atomic::AtomicU64::new(1000),
+            peaks: Mutex::new(sgtop::derive::Peaks::default()),
+        })
+    };
+    let render = |cols: u16, rows: u16, shared: &Arc<Shared>| {
+        let backend = TestBackend::new(cols, rows);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &ui_default(), shared)).unwrap();
+        let mut out = String::new();
+        for row in 0..rows {
+            for col in 0..cols {
+                out.push(
+                    terminal.backend().buffer()[(col, row)]
+                        .symbol()
+                        .chars()
+                        .next()
+                        .unwrap_or(' '),
+                );
+            }
+            out.push('\n');
+        }
+        out
+    };
+
+    let shared = shared_for();
+    let first = render(120, 30, &shared);
+    let again = render(120, 30, &shared_for());
+    assert_eq!(
+        first, again,
+        "the zero state must render identically every frame"
+    );
+
+    assert!(first.contains("sgtop"), "header missing:\n{first}");
+    assert!(first.contains("Engine status"), "hero frame missing");
+    assert!(first.contains("Latency"), "latency panel missing");
+    assert!(first.contains("Peaks"), "peaks panel missing");
+    // the peaks panel shows the missing marker for every zero value
+    assert!(
+        first.contains("decode   —"),
+        "peaks placeholders missing:\n{first}"
+    );
+    // an empty ring plots no graphs and shows no hero numbers
+    assert!(!first.contains("Prefill"), "a graph rendered from no data");
+    assert!(!first.contains("Decode"), "a graph rendered from no data");
+    assert!(
+        !first.contains("RUNNING"),
+        "hero numbers rendered from no data"
+    );
+    assert!(!first.contains("NaN"), "a NaN reached the screen:\n{first}");
+
+    // A terminal too small for the panels' combined minimum height has
+    // more than one valid layout split, and which split the solver lands
+    // on is not stable across runs
+    // (solver variable ids are process global, so parallel tests shift them).
+    // Content is therefore pinned
+    // at the size above, whose panel minimums exactly fill the screen,
+    // while smaller terminals get a no-panic check only.
+    let _ = render(40, 8, &shared_for());
+}

@@ -973,3 +973,620 @@ fn cached_window_scan_tracks_the_ring() {
         h.window_entries(Duration::from_secs(60)).len() - 1
     );
 }
+
+// ---- busy-server fixture: a loaded server, generated in code ----
+
+/// Decode counter state the busy fixture carries at scrape `step`:
+/// 40 tokens/s for the first 5 steps, then 80 tokens/s. Counters
+/// advance one scrape interval (1s) per step, so window rates
+/// and histogram deltas stay hand-computable.
+fn busy_decode_counter(step: u32) -> f64 {
+    if step <= 5 {
+        40.0 * f64::from(step)
+    } else {
+        200.0 + 80.0 * f64::from(step - 5)
+    }
+}
+
+/// What the busy fixture's decode counter line holds at one scrape:
+/// a normal reading, no line at all, or a non-finite reading. Absent
+/// is the shape an unreadable value leaves after the parse boundary
+/// drops it.
+#[derive(Clone, Copy, Debug)]
+enum BusyDecode {
+    Normal,
+    Absent,
+    NonFinite,
+}
+
+/// Cumulative histogram lines for one family: `bounds` lists the finite
+/// `le` bounds, `cum` the cumulative count through each bound. A final
+/// `cum` entry covers the +Inf bucket, so `cum` always has one entry
+/// more than `bounds` holds.
+fn hist_lines(name: &str, bounds: &[f64], cum: &[f64]) -> String {
+    let mut s = format!("# TYPE {name} histogram\n");
+    for (le, c) in bounds.iter().zip(cum) {
+        s.push_str(&format!("{name}_bucket{{le=\"{le}\"}} {c}\n"));
+    }
+    let total = cum[cum.len() - 1];
+    s.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {total}\n"));
+    s.push_str(&format!("{name}_count {total}\n"));
+    s.push_str(&format!("{name}_sum {}\n", total * 0.1));
+    s
+}
+
+/// One scrape of a loaded server: running slots above zero, a queue,
+/// tokens advancing, non-trivial histogram traffic, all four pool
+/// families, and the L2/health counters. Every counter advances
+/// linearly in `step` (its per-second rate is the per-step delta),
+/// so every derived number has a hand-computable expectation.
+fn busy_body(step: u32, decode: BusyDecode) -> String {
+    let s = f64::from(step);
+    let decode_line = match decode {
+        BusyDecode::Normal => format!(
+            "sglang:realtime_tokens_total{{mode=\"decode\"}} {}\n",
+            busy_decode_counter(step)
+        ),
+        BusyDecode::NonFinite => "sglang:realtime_tokens_total{mode=\"decode\"} NaN\n".into(),
+        BusyDecode::Absent => String::new(),
+    };
+    format!(
+        "# TYPE sglang:realtime_tokens_total counter\n\
+         {decode_line}\
+         sglang:realtime_tokens_total{{mode=\"prefill_compute\"}} {}\n\
+         # TYPE sglang:num_running_reqs gauge\n\
+         sglang:num_running_reqs{{engine_type=\"unified\",model_name=\"busy-model\"}} 4\n\
+         # TYPE sglang:num_queue_reqs gauge\n\
+         sglang:num_queue_reqs 2\n\
+         # TYPE sglang:num_prefill_bootstrap_queue_reqs gauge\n\
+         sglang:num_prefill_bootstrap_queue_reqs 1\n\
+         # TYPE sglang:num_prefill_inflight_queue_reqs gauge\n\
+         sglang:num_prefill_inflight_queue_reqs 2\n\
+         # TYPE sglang:num_decode_prealloc_queue_reqs gauge\n\
+         sglang:num_decode_prealloc_queue_reqs 3\n\
+         # TYPE sglang:num_decode_transfer_queue_reqs gauge\n\
+         sglang:num_decode_transfer_queue_reqs 4\n\
+         # TYPE sglang:num_grammar_queue_reqs gauge\n\
+         sglang:num_grammar_queue_reqs 5\n\
+         # TYPE sglang:token_usage gauge\n\
+         sglang:token_usage 0.8\n\
+         # TYPE sglang:kv_used_tokens gauge\n\
+         sglang:kv_used_tokens 8000\n\
+         # TYPE sglang:max_total_num_tokens gauge\n\
+         sglang:max_total_num_tokens 10000\n\
+         # TYPE sglang:mamba_used_tokens gauge\n\
+         sglang:mamba_used_tokens 200\n\
+         # TYPE sglang:mamba_available_tokens gauge\n\
+         sglang:mamba_available_tokens 800\n\
+         # TYPE sglang:mamba_usage gauge\n\
+         sglang:mamba_usage 0.2\n\
+         # TYPE sglang:swa_used_tokens gauge\n\
+         sglang:swa_used_tokens 100\n\
+         # TYPE sglang:swa_available_tokens gauge\n\
+         sglang:swa_available_tokens 300\n\
+         # TYPE sglang:swa_token_usage gauge\n\
+         sglang:swa_token_usage 0.25\n\
+         # TYPE sglang:hicache_host_total_tokens gauge\n\
+         sglang:hicache_host_total_tokens 50000\n\
+         # TYPE sglang:hicache_host_used_tokens gauge\n\
+         sglang:hicache_host_used_tokens 40000\n\
+         # TYPE sglang:cache_hit_rate gauge\n\
+         sglang:cache_hit_rate 0.73\n\
+         # TYPE sglang:spec_accept_rate gauge\n\
+         sglang:spec_accept_rate 0.65\n\
+         # TYPE sglang:spec_accept_length gauge\n\
+         sglang:spec_accept_length 3.25\n\
+         # TYPE sglang:gen_throughput gauge\n\
+         sglang:gen_throughput 123.4\n\
+         # TYPE sglang:new_token_ratio gauge\n\
+         sglang:new_token_ratio 0.35\n\
+         # TYPE sglang:decode_sum_seq_lens gauge\n\
+         sglang:decode_sum_seq_lens 40\n\
+         # TYPE sglang:http_requests_active gauge\n\
+         sglang:http_requests_active 3\n\
+         # TYPE sglang:http_responses_total counter\n\
+         sglang:http_responses_total{{status_code=\"200\"}} {}\n\
+         sglang:http_responses_total{{status_code=\"503\"}} {}\n\
+         # TYPE sglang:evicted_tokens_total counter\n\
+         sglang:evicted_tokens_total {}\n\
+         # TYPE sglang:num_retracted_reqs counter\n\
+         sglang:num_retracted_reqs {}\n\
+         # TYPE sglang:hicache_backup_tokens_total counter\n\
+         sglang:hicache_backup_tokens_total {}\n\
+         # TYPE sglang:load_back_tokens_total counter\n\
+         sglang:load_back_tokens_total {}\n\
+         # TYPE sglang:hicache_dropped_tokens_total counter\n\
+         sglang:hicache_dropped_tokens_total 0\n\
+         # TYPE sglang:prefill_effective_tokens_total counter\n\
+         sglang:prefill_effective_tokens_total{{mode=\"device_hit\"}} {}\n\
+         sglang:prefill_effective_tokens_total{{mode=\"host_hit\"}} {}\n\
+         sglang:prefill_effective_tokens_total{{mode=\"miss\"}} {}\n\
+         # TYPE sglang:process_cpu_seconds_total counter\n\
+         sglang:process_cpu_seconds_total{{component=\"tokenizer\"}} {}\n\
+         sglang:process_cpu_seconds_total{{component=\"detokenizer\"}} {}\n\
+         # TYPE sglang:scheduler_process_cpu_seconds_total counter\n\
+         sglang:scheduler_process_cpu_seconds_total {}\n\
+         {}{}{}{}{}",
+        100.0 * s,
+        10.0 * s,
+        2.0 * s,
+        5.0 * s,
+        1.0 * s,
+        25.0 * s,
+        15.0 * s,
+        60.0 * s,
+        30.0 * s,
+        10.0 * s,
+        0.5 * s,
+        0.3 * s,
+        0.8 * s,
+        // ttft: +2 obs <= 0.1, +3 in (0.1, 1], +1 in (1, 10] per step
+        hist_lines(
+            "sglang:time_to_first_token_seconds",
+            &[0.1, 1.0, 10.0],
+            &[2.0 * s, 5.0 * s, 6.0 * s, 6.0 * s],
+        ),
+        // itl: +2 obs per finite bucket per step
+        hist_lines(
+            "sglang:inter_token_latency_seconds",
+            &[0.02, 0.1, 1.0],
+            &[2.0 * s, 4.0 * s, 6.0 * s, 6.0 * s],
+        ),
+        // e2e: +1 <= 0.5, +3 in (0.5, 2], +2 in (2, 8] per step
+        hist_lines(
+            "sglang:e2e_request_latency_seconds",
+            &[0.5, 2.0, 8.0],
+            &[1.0 * s, 4.0 * s, 6.0 * s, 6.0 * s],
+        ),
+        // queue time: +4 <= 0.05, +2 in (0.05, 0.5] per step
+        hist_lines(
+            "sglang:queue_time_seconds",
+            &[0.05, 0.5],
+            &[4.0 * s, 6.0 * s, 6.0 * s],
+        ),
+        // prompt length: +1 <= 128, +2 in (128, 512], +3 in (512, 2048]
+        hist_lines(
+            "sglang:prompt_tokens_histogram",
+            &[128.0, 512.0, 2048.0],
+            &[1.0 * s, 3.0 * s, 6.0 * s, 6.0 * s],
+        ),
+    )
+}
+
+/// A busy server scraped once per second for `steps` steps.
+fn busy_history(steps: usize) -> History {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    for i in 0..steps {
+        h.push(
+            t0 + Duration::from_secs(i as u64),
+            parse(&busy_body(i as u32, BusyDecode::Normal)).unwrap(),
+        );
+    }
+    h
+}
+
+fn busy_derived() -> sgtop::derive::Derived {
+    derive(&busy_history(6), 2).unwrap()
+}
+
+// The headline identity lines come from the running-count series labels,
+// so a fixture whose labels differ from the live exporter still pins
+// the label-extraction path.
+#[test]
+fn busy_server_names_model_and_engine_from_series_labels() {
+    let d = busy_derived();
+    assert_eq!(d.model, "busy-model");
+    assert_eq!(d.engine, "unified");
+}
+
+// The focused window rides through derive untouched, so the UI's window
+// switch lands on the same number derive computed.
+#[test]
+fn window_focus_passes_through_derive() {
+    for focus in 0..3 {
+        let d = derive(&busy_history(6), focus).unwrap();
+        assert_eq!(d.window_focus, focus);
+    }
+}
+
+// RUNNING is the running count of the latest scrape, not an average
+// over the window: an engine that just got calmer reads the calm number.
+#[test]
+fn running_reports_the_latest_scrape() {
+    let d = busy_derived();
+    assert_eq!(d.running, Some(4.0));
+}
+
+// QUEUE is the latest scrape's waiting count.
+#[test]
+fn queue_reports_the_latest_scrape() {
+    let d = busy_derived();
+    assert_eq!(d.queue, Some(2.0));
+}
+
+// Each subqueue reads its own gauge from the latest scrape.
+#[test]
+fn subqueue_gauges_read_the_latest_scrape() {
+    let d = busy_derived();
+    let expected = [
+        ("prefill bootstrap", 1.0),
+        ("prefill inflight", 2.0),
+        ("decode prealloc", 3.0),
+        ("decode transfer", 4.0),
+        ("grammar", 5.0),
+    ];
+    assert_eq!(d.subqueues.len(), expected.len());
+    for ((name, got), (want_name, want)) in d.subqueues.iter().zip(expected) {
+        assert_eq!(*name, want_name);
+        assert_eq!(*got, Some(want), "subqueue {name} was {got:?}");
+    }
+}
+
+// The three rate windows see different slices of a rate change: the 5s
+// window holds only the fast interval, the 15s and 60s windows average
+// the slow first half in. Deltas are 40 tokens/s for steps 1-5 and 80
+// after, so 5s reads 400/5 = 80 and the full 10s span reads 600/10 = 60.
+#[test]
+fn decode_rates_span_all_three_windows() {
+    let d = derive(&busy_history(11), 2).unwrap();
+    assert_eq!(d.decode_rate[0], Some(80.0));
+    assert_eq!(d.decode_rate[1], Some(60.0));
+    assert_eq!(d.decode_rate[2], Some(60.0));
+}
+
+// The instant decode rate is the most recent scrape interval's rate,
+// not a windowed average: with the last interval at 80 tokens/s,
+// the instant reads 80, while the 60s window averages
+// the slower first half to 60.
+#[test]
+fn decode_instant_is_the_most_recent_interval() {
+    let d = derive(&busy_history(11), 2).unwrap();
+    assert_eq!(d.decode_instant, Some(80.0));
+}
+
+// Prefill runs at a constant 100 tokens/s in the fixture, so all three
+// windows agree with the instant rate.
+#[test]
+fn prefill_rates_span_all_three_windows() {
+    let d = busy_derived();
+    assert_eq!(d.prefill_rate[0], Some(100.0));
+    assert_eq!(d.prefill_rate[1], Some(100.0));
+    assert_eq!(d.prefill_rate[2], Some(100.0));
+    assert_eq!(d.prefill_instant, Some(100.0));
+}
+
+// The pool rows carry the usage ratio plus the engine-reported absolute
+// counts, with the unit saying what the counts count.
+#[test]
+fn pool_rows_carry_usage_counts_and_units() {
+    let d = busy_derived();
+    let find = |name: &str| {
+        d.pools
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("pool {name} missing"))
+    };
+    let kv = find("KV");
+    assert_eq!(kv.usage, 0.8);
+    assert_eq!(kv.used, Some(8000.0));
+    assert_eq!(kv.total, Some(10000.0));
+    assert_eq!(kv.unit, "tokens");
+    let mamba = find("mamba");
+    assert_eq!(mamba.usage, 0.2);
+    assert_eq!(mamba.used, Some(200.0));
+    assert_eq!(mamba.total, Some(1000.0));
+    assert_eq!(mamba.unit, "slots");
+    let swa = find("SWA");
+    assert_eq!(swa.usage, 0.25);
+    assert_eq!(swa.unit, "slots");
+    let host = find("host");
+    assert_eq!(host.usage, 0.8);
+    assert_eq!(host.used, Some(40000.0));
+    assert_eq!(host.total, Some(50000.0));
+    assert_eq!(host.unit, "tokens");
+}
+
+// The pool graph lanes recompute the ratios from raw counts, so a graph
+// tick can never disagree with the pool row above it.
+#[test]
+fn pool_graph_lanes_match_the_pool_rows() {
+    let d = busy_derived();
+    assert_eq!(d.graphs.pool_kv, vec![0.8; 5]);
+    assert_eq!(d.graphs.pool_mamba, vec![0.2; 5]);
+    assert_eq!(d.graphs.pool_swa, vec![0.25; 5]);
+    assert_eq!(d.graphs.pool_host, vec![0.8; 5]);
+}
+
+#[test]
+fn cache_hit_rate_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().cache_hit, Some(0.73));
+}
+
+#[test]
+fn spec_accept_rate_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().spec_accept, Some(0.65));
+}
+
+#[test]
+fn spec_accept_length_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().spec_accept_len, Some(3.25));
+}
+
+// TTFT quantiles from window bucket deltas, hand-computed. Deltas over
+// the window: 10 obs <= 0.1, 15 in (0.1, 1], 5 in (1, 10], total 30.
+// p50 rank 15:  0.1 + 5/15 * 0.9 = 0.4
+// p95 rank 28.5: 1 + 3.5/5 * 9 = 7.3
+// p99 rank 29.7: 1 + 4.7/5 * 9 = 9.46
+#[test]
+fn ttft_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    let q = &d.ttft[2];
+    assert!((q.p50.unwrap() - 0.4).abs() < 1e-9, "p50 was {:?}", q.p50);
+    assert!((q.p95.unwrap() - 7.3).abs() < 1e-9, "p95 was {:?}", q.p95);
+    assert!((q.p99.unwrap() - 9.46).abs() < 1e-9, "p99 was {:?}", q.p99);
+}
+
+// ITL deltas over the window: 10 obs <= 0.02, 10 more in (0.02, 0.1],
+// and 10 in (0.1, 1].
+// p50 rank 15: 0.02 + 5/10 * 0.08 = 0.06
+// p95 rank 28.5: 0.1 + 8.5/10 * 0.9 = 0.865
+// p99 rank 29.7: 0.1 + 9.7/10 * 0.9 = 0.973
+#[test]
+fn itl_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    let q = &d.itl[2];
+    assert!((q.p50.unwrap() - 0.06).abs() < 1e-9, "p50 was {:?}", q.p50);
+    assert!((q.p95.unwrap() - 0.865).abs() < 1e-9, "p95 was {:?}", q.p95);
+    assert!((q.p99.unwrap() - 0.973).abs() < 1e-9, "p99 was {:?}", q.p99);
+}
+
+// E2E deltas: 5 obs <= 0.5, 15 in (0.5, 2], 10 in (2, 8].
+// p50 rank 15: 0.5 + 10/15 * 1.5 = 1.5
+// p95 rank 28.5: 2 + 8.5/10 * 6 = 7.1
+// p99 rank 29.7: 2 + 9.7/10 * 6 = 7.82
+#[test]
+fn e2e_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    let q = &d.e2e[2];
+    assert!((q.p50.unwrap() - 1.5).abs() < 1e-9, "p50 was {:?}", q.p50);
+    assert!((q.p95.unwrap() - 7.1).abs() < 1e-9, "p95 was {:?}", q.p95);
+    assert!((q.p99.unwrap() - 7.82).abs() < 1e-9, "p99 was {:?}", q.p99);
+}
+
+// Queue-time deltas: 20 obs <= 0.05, 10 in (0.05, 0.5].
+// p50 rank 15 sits in the first bucket, which starts at 0:
+// 15/20 * 0.05 = 0.0375
+// p95 rank 28.5: 0.05 + 8.5/10 * 0.45 = 0.4325
+// p99 rank 29.7: 0.05 + 9.7/10 * 0.45 = 0.4865
+#[test]
+fn queue_time_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    let q = &d.queue_time[2];
+    assert!(
+        (q.p50.unwrap() - 0.0375).abs() < 1e-9,
+        "p50 was {:?}",
+        q.p50
+    );
+    assert!(
+        (q.p95.unwrap() - 0.4325).abs() < 1e-9,
+        "p95 was {:?}",
+        q.p95
+    );
+    assert!(
+        (q.p99.unwrap() - 0.4865).abs() < 1e-9,
+        "p99 was {:?}",
+        q.p99
+    );
+}
+
+// Prompt-length deltas: 5 obs <= 128, 10 in (128, 512], then 15 more
+// in (512, 2048]. p50 rank 15 lands exactly on the 512 boundary.
+// p95 rank 28.5: 512 + 13.5/15 * 1536 = 1894.4.
+#[test]
+fn prompt_len_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    assert_eq!(d.prompt_len_p50, Some(512.0));
+    assert!((d.prompt_len_p95.unwrap() - 1894.4).abs() < 1e-9);
+}
+
+// The stall banner stays silent on a uniformly busy server: decode well
+// above a quarter of the window median, prefill computing, nothing
+// frozen in any window.
+#[test]
+fn busy_server_has_no_stalls_in_any_window() {
+    let d = busy_derived();
+    for (i, s) in d.stalls.iter().enumerate() {
+        assert_eq!(s.count, 0, "window {i} counted {s:?}");
+        assert_eq!(s.seconds, 0.0);
+    }
+}
+
+// A decode reading dropped mid-window is a gap rather than a collapse:
+// the interval leading out of the gap is flagged
+// (running > 0, prefill computing, rate 0), the interval into the gap
+// is not, and a NaN reading flags identically because the parse boundary
+// dropped it before the scan ever saw it.
+#[test]
+fn stall_banner_counts_one_frozen_second_per_gap() {
+    for variant in [BusyDecode::Absent, BusyDecode::NonFinite] {
+        let mut h = History::default();
+        let t0 = Instant::now();
+        for i in 0..6u32 {
+            let decode = if i == 2 { variant } else { BusyDecode::Normal };
+            h.push(
+                t0 + Duration::from_secs(u64::from(i)),
+                parse(&busy_body(i, decode)).unwrap(),
+            );
+        }
+        let d = derive(&h, 2).unwrap();
+        assert_eq!(
+            d.graphs.stall,
+            vec![false, false, true, false, false],
+            "flags for {variant:?} were {:?}",
+            d.graphs.stall
+        );
+        assert_eq!(d.stalls[2].count, 1);
+        assert!((d.stalls[2].seconds - 1.0).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn evict_rate_counts_evicted_tokens_per_second() {
+    assert_eq!(busy_derived().evict_rate, Some(5.0));
+}
+
+#[test]
+fn retract_rate_counts_retracted_requests_per_second() {
+    assert_eq!(busy_derived().retract_rate, Some(1.0));
+}
+
+// Only the 503 series feeds the 503 rate: a busy 200 series in the same
+// family must not leak into it.
+#[test]
+fn http_503_rate_isolates_the_503_series() {
+    assert_eq!(busy_derived().http_503_rate, Some(2.0));
+}
+
+#[test]
+fn http_active_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().http_active, Some(3.0));
+}
+
+#[test]
+fn gen_throughput_gauge_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().gen_throughput_gauge, Some(123.4));
+}
+
+// Device and host hit rates split their own modes against the whole
+// family's total: 60 + 30 + 10 tokens/s, so device reads 0.6
+// and host reads 0.3.
+#[test]
+fn l2_hit_rates_split_device_and_host_tiers() {
+    let d = busy_derived();
+    assert!((d.l2_device.unwrap() - 0.6).abs() < 1e-9);
+    assert!((d.l2_host.unwrap() - 0.3).abs() < 1e-9);
+}
+
+// Backup and load-back report their tokens/s, and a dropped-tokens
+// counter that exists but never moves reads as a present zero
+// (work tracked, none lost), not as missing data.
+#[test]
+fn l2_traffic_rates_report_backup_load_and_drop() {
+    let d = busy_derived();
+    assert_eq!(d.l2_wb, Some(25.0));
+    assert_eq!(d.l2_rb, Some(15.0));
+    assert_eq!(d.l2_drop, Some(0.0));
+}
+
+#[test]
+fn new_token_ratio_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().new_token_ratio, Some(0.35));
+}
+
+// Average generation length divides the running requests' total
+// decoded length by the running count of the latest scrape
+// (running now): 40 tokens across 4 requests reads 10.
+#[test]
+fn gen_progress_averages_over_the_requests_running_now() {
+    assert_eq!(busy_derived().gen_progress, Some(10.0));
+}
+
+#[test]
+fn cpu_tokenizer_rate_counts_seconds_per_second() {
+    assert_eq!(busy_derived().cpu_tokenizer, Some(0.5));
+}
+
+#[test]
+fn cpu_detokenizer_rate_counts_seconds_per_second() {
+    assert_eq!(busy_derived().cpu_detokenizer, Some(0.3));
+}
+
+#[test]
+fn cpu_scheduler_rate_counts_seconds_per_second() {
+    assert_eq!(busy_derived().cpu_scheduler, Some(0.8));
+}
+
+// The graph lanes replay the fixture's per-interval rates: 40 tokens/s
+// of decode and 100 of prefill across all five intervals, no presence
+// flags, one second per interval.
+#[test]
+fn busy_graph_lanes_replay_the_intervals() {
+    let d = busy_derived();
+    assert_eq!(d.graphs.decode.vals, vec![40.0; 5]);
+    assert_eq!(d.graphs.prefill.vals, vec![100.0; 5]);
+    assert_eq!(d.graphs.decode.absent_old, vec![false; 5]);
+    assert_eq!(d.graphs.decode.absent_new, vec![false; 5]);
+    assert_eq!(d.graphs.dt, vec![1.0; 5]);
+}
+
+// Each graph lane divides its interval's decode rate by the running
+// count at that interval's later sample, never by the latest scrape's
+// count. One shared history pins both semantics: the fixture carries
+// 4 running requests at its first sample, then 8 at the second,
+// so lane one reads 5 (40/8) while headline RUNNING
+// and the generation average read the latest count, 4.
+#[test]
+fn per_stream_uses_the_running_count_of_its_own_interval() {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    for (i, running) in [4.0, 8.0, 4.0, 4.0].iter().enumerate() {
+        let body = format!(
+            "# TYPE sglang:realtime_tokens_total counter\n\
+             sglang:realtime_tokens_total{{mode=\"decode\"}} {}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs {running}\n\
+             # TYPE sglang:decode_sum_seq_lens gauge\n\
+             sglang:decode_sum_seq_lens 40\n",
+            40.0 * i as f64
+        );
+        h.push(t0 + Duration::from_secs(i as u64), parse(&body).unwrap());
+    }
+    let d = derive(&h, 2).unwrap();
+    assert_eq!(d.graphs.decode.vals, vec![40.0; 3]);
+    assert_eq!(d.graphs.per_stream, vec![Some(5.0), Some(10.0), Some(10.0)]);
+    assert_eq!(d.running, Some(4.0));
+    assert_eq!(d.gen_progress, Some(10.0));
+}
+
+// Session peaks only ever move up while one engine process runs: each
+// scrape folds max(existing, new rate). Deltas here climb 40, 80, 120,
+// 160 and then drop to 20, and the peaks must stay at the 160 interval.
+#[test]
+fn session_peaks_only_grow_until_a_counter_reset() {
+    use sgtop::derive::{update_peaks, Peaks};
+
+    let decode_values = [0.0, 40.0, 120.0, 240.0, 400.0, 420.0];
+    let mut h = History::default();
+    let mut peaks = Peaks::default();
+    let t0 = Instant::now();
+    let mut seen_decode = Vec::new();
+    for (i, v) in decode_values.iter().enumerate() {
+        let body = format!(
+            "# TYPE sglang:realtime_tokens_total counter\n\
+             sglang:realtime_tokens_total{{mode=\"decode\"}} {v}\n\
+             sglang:realtime_tokens_total{{mode=\"prefill_compute\"}} {}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 4\n",
+            100.0 * i as f64
+        );
+        h.push(t0 + Duration::from_secs(i as u64), parse(&body).unwrap());
+        update_peaks(&mut peaks, &h);
+        seen_decode.push(peaks.decode);
+        if i > 0 {
+            assert_eq!(peaks.prefill, Some(100.0), "prefill peak moved at step {i}");
+        }
+    }
+    assert_eq!(
+        seen_decode,
+        vec![
+            None,
+            Some(40.0),
+            Some(80.0),
+            Some(120.0),
+            Some(160.0),
+            Some(160.0)
+        ]
+    );
+    assert_eq!(peaks.decode_single, Some(40.0)); // 160 tok/s across 4 requests
+}
