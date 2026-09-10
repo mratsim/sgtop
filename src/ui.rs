@@ -1289,11 +1289,7 @@ fn health_col_kvs(
     h
 }
 
-fn peaks_col_lines(
-    d: Option<&Derived>,
-    peaks: &crate::derive::Peaks,
-    t: &Theme,
-) -> Vec<Line<'static>> {
+fn peaks_col_lines(peaks: &crate::derive::Peaks, t: &Theme) -> Vec<Line<'static>> {
     // the single row carries the single-stream accent, matching the decode
     // canvas's own single-stream line color
     let pk = |label: &str, v: Option<f64>, color: ratatui::style::Color| {
@@ -1306,19 +1302,11 @@ fn peaks_col_lines(
             ),
         ])
     };
-    let mut l = vec![
+    let l = vec![
         pk("decode", peaks.decode, t.fg),
         pk("prefill", peaks.prefill, t.fg),
         pk("single", peaks.decode_single, t.accent),
     ];
-    l.push(Line::from(vec![
-        Span::styled(" engine   ".to_string(), Style::new().fg(t.dim)),
-        Span::styled(
-            d.map(|d| tok_gauge(d.gen_throughput_gauge))
-                .unwrap_or_else(|| "\u{2014}".into()),
-            Style::new().fg(t.fg),
-        ),
-    ]));
     l
 }
 
@@ -1337,7 +1325,7 @@ fn detail_height(
         quality_col_kvs(d).len(),
         cache_col_kvs(d, t).len(),
         health_col_kvs(d, focus, t, alarms).len(),
-        peaks_col_lines(d, peaks, t).len(),
+        peaks_col_lines(peaks, t).len(),
     ]
     .into_iter()
     .max()
@@ -1440,7 +1428,7 @@ fn draw_detail(
 
     let b4 = block(t, "Peaks", Some("since sgtop started"));
     let inner4 = b4.inner(cols[3]);
-    let l4 = peaks_col_lines(d, &peaks, t)
+    let l4 = peaks_col_lines(&peaks, t)
         .into_iter()
         .map(|l| truncate_line(l, inner4.width as usize))
         .collect::<Vec<Line>>();
@@ -1761,8 +1749,4 @@ fn fmt_secs(v: Option<f64>) -> String {
         Some(v) => format!("{:.0}ms", v * 1000.0),
         None => "—".into(),
     }
-}
-
-fn tok_gauge(v: Option<f64>) -> String {
-    v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into())
 }

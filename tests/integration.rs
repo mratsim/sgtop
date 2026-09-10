@@ -1770,11 +1770,6 @@ fn http_503_rate_isolates_the_503_series() {
     assert_eq!(busy_derived().http_503_rate, Some(2.0));
 }
 
-#[test]
-fn gen_throughput_gauge_reads_the_latest_gauge() {
-    assert_eq!(busy_derived().gen_throughput_gauge, Some(123.4));
-}
-
 // Device and host hit rates split their own modes against the whole
 // family's total: 60 + 30 + 10 tokens/s, so device reads 0.6
 // and host reads 0.3.

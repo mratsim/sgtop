@@ -178,7 +178,6 @@ pub struct Derived {
     pub evict_rate: Option<f64>,
     pub retract_rate: Option<f64>,
     pub http_503_rate: Option<f64>,
-    pub gen_throughput_gauge: Option<f64>,
     /// L2/HiCache: per-tier prefill hit rates (fraction of prefill tokens
     /// served from device/host tier, windowed)
     pub l2_device: Option<f64>,
@@ -786,7 +785,6 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
         evict_rate,
         retract_rate,
         http_503_rate,
-        gen_throughput_gauge: h.gauge_pred(fam("sglang:gen_throughput")),
         l2_device: l2_hit_rate(h, EFFECTIVE_HIT_MODES[0]),
         l2_host: l2_hit_rate(h, EFFECTIVE_HIT_MODES[1]),
         l2_wb: h.rate_sum(fam("sglang:hicache_backup_tokens_total"), WINDOWS[2]),
