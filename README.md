@@ -39,13 +39,15 @@ no storage, no daemon.
   aggregated across TP ranks per metric type without double-counting the
   logical KV capacity (`max_total_num_tokens` is exported per rank but is
   one logical pool). KV/mamba full = requests wait; host full is normal
-  (LRU prefix cache — watch evictions/s instead).
+  (an LRU prefix cache that recycles its own old entries; `evictions/s`
+  tracks the device KV cache, not the host tier).
 - **Latency.** TTFT / ITL / e2e / queue time as p50/p95/p99 per window. Each
   window column is a fresh quantile computed from histogram bucket deltas
   over 5s/15s/60s — no smoothing across windows; the cumulative snapshot is
   only a labeled fallback when a window is sparse.
 - **Health counters.** Evictions/s, retractions/s, 503/s, retracted
-  requests, L2 (host-tier) drops, open HTTP connections, tokenizer/
+  requests, l2 drop/s (device KV tokens destroyed without a host backup), open
+  HTTP connections, tokenizer/
   detokenizer/scheduler CPU cores.
 - **Two phase vocabularies.** Graph titles gloss prefill as *prompt
   processing* and decode as *token generation* (llama.cpp terms); `e` opens
@@ -79,6 +81,10 @@ sgtop --api-key sk-...                                    # if server uses --api
 sgtop --once                # one text snapshot, for scripts/cron
 ```
 
+`--insecure` accepts any server certificate: the bearer token and the metrics
+transit without TLS verification. While it is active, a `⚠ insecure TLS`
+marker appears in the header and in `--once` output.
+
 ## Keys
 
 | Key | Action |
@@ -87,7 +93,7 @@ sgtop --once                # one text snapshot, for scripts/cron
 | `space` | pause scraping |
 | `c` | toggle compact / full layout |
 | `g` | toggle graphs |
-| `1` `2` `3` | graphs follow the 5s / 15s / 60s window |
+| `1` `2` `3` | focus the 5s / 15s / 60s window (graphs stay 60s) |
 | `t` | cycle theme (gruvbox, catppuccin, tokyonight) |
 | `e` | explain screen |
 | `?` | keymap |

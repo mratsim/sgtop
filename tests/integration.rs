@@ -1,23 +1,30 @@
 use std::time::{Duration, Instant};
 
 use sgtop::derive::{derive, WINDOWS};
-use sgtop::history::{quantile_from_buckets, History};
-use sgtop::metrics::{parse, Sample, SeriesKey};
+use sgtop::history::{quantile_from_buckets, History, RING_CAP};
+use sgtop::metrics::{parse, Sample, SeriesKey, BUCKET_CAP, SERIES_CAP};
 
 fn fixture() -> String {
-    std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/live.txt")).unwrap()
+    std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/live.txt"
+    ))
+    .unwrap()
 }
 
 fn key(name: &str, labels: &[(&str, &str)]) -> SeriesKey {
     SeriesKey {
         name: name.into(),
-        labels: labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        labels: labels
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
     }
 }
 
 #[test]
 fn parses_live_fixture() {
-    let s = parse(&fixture());
+    let s = parse(&fixture()).unwrap();
     let running = key(
         "sglang:num_running_reqs",
         &[
@@ -50,28 +57,251 @@ fn parses_live_fixture() {
     assert!(itl.le.last().unwrap().is_infinite());
     assert_eq!(itl.counts.last().unwrap(), &(expected_count as f64));
 
-    // every # HELP family must have produced at least one series
-    let help_count = fixture().lines().filter(|l| l.starts_with("# HELP")).count();
-    let families: std::collections::BTreeSet<&str> = s
+    // series must exist for every # HELP family carrying readable data.
+    // a family whose every record holds a non-finite value is no data:
+    // it parses to no series, and the UI renders the missing marker
+    // rather than a maximal value
+    let mut family_has_finite_record: std::collections::BTreeMap<String, bool> = Default::default();
+    for l in fixture().lines() {
+        let l = l.trim();
+        if l.is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let name = l
+            .split('{')
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        let base = name
+            .strip_suffix("_bucket")
+            .or_else(|| name.strip_suffix("_sum"))
+            .or_else(|| name.strip_suffix("_count"))
+            .unwrap_or(name);
+        let finite = l
+            .split_whitespace()
+            .last()
+            .and_then(|v| v.parse::<f64>().ok())
+            .is_some_and(|v| v.is_finite());
+        *family_has_finite_record
+            .entry(base.to_string())
+            .or_insert(false) |= finite;
+    }
+    let expected: std::collections::BTreeSet<String> = fixture()
+        .lines()
+        .filter(|l| l.starts_with("# HELP"))
+        .filter_map(|l| l.split_whitespace().nth(2))
+        .filter(|fam| family_has_finite_record.get(*fam).copied().unwrap_or(true))
+        .map(String::from)
+        .collect();
+    let families: std::collections::BTreeSet<String> = s
         .simple
         .keys()
         .chain(s.hist.keys())
-        .map(|k| k.name.as_str())
+        .map(|k| k.name.clone())
         .collect();
-    assert_eq!(families.len(), help_count, "parsed families must match HELP count");
+    assert_eq!(
+        families, expected,
+        "parsed families must match the HELP families carrying readable data"
+    );
 }
 
 #[test]
 fn parses_labels_with_escapes_and_timestamps() {
     let s = parse(
         "# TYPE m:gauge gauge\nm:gauge 3.5\nm:gauge{a=\"x\",b=\"say \\\"hi\\\"\"} 4.5 1234567890\n",
-    );
+    )
+    .unwrap();
     assert_eq!(s.gauge("m:gauge"), Some(3.5)); // label-less series
     let k = SeriesKey {
         name: "m:gauge".into(),
         labels: vec![("a".into(), "x".into()), ("b".into(), "say \"hi\"".into())],
     };
     assert_eq!(s.simple.get(&k), Some(&4.5));
+}
+
+#[test]
+fn label_values_with_braces_and_escapes_parse_fully() {
+    // raw payload lines: `\\` in Rust source is one backslash in the payload
+    let body = "# TYPE m gauge\n\
+        m{v=\"a{b}\"} 1\n\
+        m{v=\"a\\\"{b}\\\"\"} 2\n\
+        m{v=\"a\\\\\"} 3\n";
+    let s = parse(body).unwrap();
+    assert_eq!(s.simple.get(&key("m", &[("v", "a{b}")])), Some(&1.0));
+    // escaped quotes survive unescaping: payload value is a"{b}"
+    assert_eq!(s.simple.get(&key("m", &[("v", "a\"{b}\"")])), Some(&2.0));
+    // escaped backslash: payload value is a\
+    assert_eq!(s.simple.get(&key("m", &[("v", "a\\")])), Some(&3.0));
+}
+
+// A record whose label quote never closes is dropped like any other
+// malformed line: there is no reliable label block to recover, and
+// scanning for one must neither panic nor hang.
+#[test]
+fn record_with_unclosed_quote_is_dropped() {
+    let body = "# TYPE m gauge\nm{v=\"open 4\nm{ok=\"x\"} 5\n";
+    let s = parse(body).unwrap();
+    assert_eq!(s.simple.len(), 1);
+    assert_eq!(s.simple.get(&key("m", &[("ok", "x")])), Some(&5.0));
+}
+
+#[test]
+fn series_cap_admits_payloads_under_the_limit() {
+    // 5000 series: well under the cap, exercises the same counting path
+    let mut body = String::from("# TYPE m:g gauge\n");
+    for i in 0..5000 {
+        body.push_str(&format!("m:g{{id=\"{i}\"}} 1\n"));
+    }
+    let s = parse(&body).unwrap();
+    assert_eq!(s.simple.len(), 5000);
+}
+
+// One series past the cap rejects the entire payload: the error names
+// the cap and the observed count, and no partial sample is returned.
+#[test]
+fn series_cap_rejects_oversized_payload_whole() {
+    let mut body = String::from("# TYPE m:g gauge\n");
+    for i in 0..=SERIES_CAP {
+        body.push_str(&format!("m:g{{id=\"{i}\"}} 1\n"));
+    }
+    let err = parse(&body).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!(
+            "endpoint too large: {} series (cap {SERIES_CAP})",
+            SERIES_CAP + 1
+        )),
+        "error message was: {err}"
+    );
+}
+
+// Histogram families count as one series regardless of bucket-ladder length:
+// SERIES_CAP - 1 gauges plus one 5-record histogram family
+// sits exactly at the cap and must be accepted.
+#[test]
+fn series_cap_counts_histogram_families_not_bucket_lines() {
+    let mut body = String::from("# TYPE m:g gauge\n# TYPE m:h histogram\n");
+    for i in 0..SERIES_CAP - 1 {
+        body.push_str(&format!("m:g{{id=\"{i}\"}} 1\n"));
+    }
+    body.push_str(
+        "m:h_bucket{le=\"0.1\"} 1\n\
+         m:h_bucket{le=\"1\"} 2\n\
+         m:h_bucket{le=\"+Inf\"} 2\n\
+         m:h_count 2\n\
+         m:h_sum 1.0\n",
+    );
+    let s = parse(&body).unwrap();
+    assert_eq!(s.simple.len() + s.hist.len(), SERIES_CAP);
+}
+
+// One histogram family past the bucket cap rejects the entire payload,
+// like the series cap: the error names the cap and the observed count, and
+// no partial sample is returned.
+#[test]
+fn bucket_cap_rejects_family_over_the_limit() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..=BUCKET_CAP {
+        body.push_str(&format!("m:h_bucket{{le=\"{}\"}} 1\n", i as f64 * 0.001));
+    }
+    let err = parse(&body).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!(
+            "endpoint too large: m:h has {} buckets (cap {BUCKET_CAP})",
+            BUCKET_CAP + 1
+        )),
+        "error message was: {err}"
+    );
+}
+
+// The bucket-cap bail renders the full SeriesKey through Display.
+// This payload carries a non-`le` label so the labeled branch
+// (brace open, separators, closing brace) is exercised,
+// not just the bare family name.
+#[test]
+fn bucket_cap_error_names_the_full_labeled_family() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..=BUCKET_CAP {
+        body.push_str(&format!(
+            "m:h_bucket{{mode=\"decode\",le=\"{}\"}} 1\n",
+            i as f64 * 0.001
+        ));
+    }
+    let err = parse(&body).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!(
+            "endpoint too large: m:h{{mode=\"decode\"}} has {} buckets (cap {BUCKET_CAP})",
+            BUCKET_CAP + 1
+        )),
+        "error message was: {err}"
+    );
+}
+
+#[test]
+// a ladder of exactly BUCKET_CAP buckets is admitted
+fn bucket_cap_admits_family_at_the_limit() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..BUCKET_CAP {
+        body.push_str(&format!("m:h_bucket{{le=\"{}\"}} 1\n", i as f64 * 0.001));
+    }
+    let s = parse(&body).unwrap();
+    assert_eq!(s.hist[&key("m:h", &[])].le.len(), BUCKET_CAP);
+}
+
+#[test]
+// the cap counts _bucket records only: a family at exactly the cap takes
+// its mandatory trailing _sum/_count lines and parses, while a 257th
+// _bucket record still rejects the whole sample.
+fn bucket_cap_admits_trailing_sum_and_count_at_the_limit_but_not_a_257th_bucket() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..BUCKET_CAP {
+        body.push_str(&format!("m:h_bucket{{le=\"{}\"}} 1\n", i as f64 * 0.001));
+    }
+    body.push_str("m:h_sum 1.0\nm:h_count 2\n");
+    let s = parse(&body).unwrap();
+    assert_eq!(s.hist[&key("m:h", &[])].le.len(), BUCKET_CAP);
+    assert_eq!(s.hist[&key("m:h", &[])].count, 2);
+
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..=BUCKET_CAP {
+        body.push_str(&format!("m:h_bucket{{le=\"{}\"}} 1\n", i as f64 * 0.001));
+    }
+    let err = parse(&body).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!(
+            "endpoint too large: m:h has {} buckets (cap {BUCKET_CAP})",
+            BUCKET_CAP + 1
+        )),
+        "error message was: {err}"
+    );
+}
+
+// A hostile label value that trips the bucket cap reaches the error
+// banner only after sanitization. The hostile value carries terminal
+// escape sequences, the delete byte, carriage returns, and an unescaped newline:
+// the stored message renders every control as visible notation, keeps
+// raw control bytes out, and stays debuggable (family, labels, cap intact).
+#[test]
+fn hostile_label_in_cap_error_is_banner_safe_after_sanitization() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..=BUCKET_CAP {
+        body.push_str(&format!(
+            "m:h_bucket{{mode=\"\u{1b}[2J\u{7f}\r\\nx\",le=\"{}\"}} 1\n",
+            i as f64 * 0.001
+        ));
+    }
+    let err = parse(&body).unwrap_err().to_string();
+    // the raw bail does carry the injected controls
+    assert!(err.chars().any(|c| c == '\u{1b}'), "message was: {err:?}");
+    let safe = sgtop::scrape::sanitize_for_terminal(&err);
+    assert!(!safe.chars().any(char::is_control), "message was: {safe:?}");
+    for notation in ["\\x1b", "\\x7f", "\\r", "\\n"] {
+        assert!(safe.contains(notation), "missing {notation}: {safe:?}");
+    }
+    // still debuggable: family, label name, and cap survive
+    assert!(safe.contains("m:h{mode="));
+    assert!(safe.contains("(cap 256)"));
 }
 
 #[test]
@@ -87,7 +317,7 @@ fn quantile_linear_interpolation() {
 }
 
 fn one_gauge(name: &str, v: f64) -> Sample {
-    parse(&format!("# TYPE {name} gauge\n{name} {v}\n"))
+    parse(&format!("# TYPE {name} gauge\n{name} {v}\n")).unwrap()
 }
 
 #[test]
@@ -117,8 +347,9 @@ fn window_quantile_falls_back_when_sparse() {
     let body = "# TYPE m:lat histogram\n\
         m:lat_bucket{le=\"0.1\"} 10\nm:lat_bucket{le=\"1\"} 19\nm:lat_bucket{le=\"+Inf\"} 20\n\
         m:lat_count 20\nm:lat_sum 5.0\n";
-    h.push(t0, parse(body));
-    h.push(t0 + Duration::from_secs(1), parse(body)); // identical -> zero new observations
+    h.push(t0, parse(body).unwrap());
+    // identical -> zero new observations
+    h.push(t0 + Duration::from_secs(1), parse(body).unwrap());
     // sparse (<5 observations in window) -> snapshot fallback must kick in
     let q = h.hist_quantile(|k| k.name == "m:lat", 0.5, Duration::from_secs(60));
     let snapshot = h.hist_snapshot_quantile(&|k: &SeriesKey| k.name == "m:lat", 0.5);
@@ -135,6 +366,7 @@ fn mix(decode: f64, prefill: f64) -> Sample {
          # TYPE sglang:num_running_reqs gauge\n\
          sglang:num_running_reqs 4\n"
     ))
+    .unwrap()
 }
 
 #[test]
@@ -149,7 +381,10 @@ fn stall_signature_detected() {
     h.push(t0 + Duration::from_secs(3), mix(42.0, 200.0));
     let d = derive(&h, 0).unwrap();
     let stalls = d.stalls[0]; // 5s window
-    assert!(stalls.count >= 1, "expected stall detection, got {stalls:?}");
+    assert!(
+        stalls.count >= 1,
+        "expected stall detection, got {stalls:?}"
+    );
     assert!(stalls.seconds > 0.0, "stall seconds must be positive");
 
     let mut h = History::default();
@@ -181,7 +416,7 @@ fn session_peaks_accumulate_and_reset_on_restart() {
     update_peaks(&mut peaks, &h);
     assert_eq!(peaks.decode, Some(140.0)); // 240-100 over the last 1s
     assert_eq!(peaks.prefill, Some(500.0)); // first interval 0->500 beats 400
-    // single = 140 decode / 4 running
+                                            // single = 140 decode / 4 running
     assert_eq!(peaks.decode_single, Some(35.0));
 
     // lower follow-up intervals must not lower the peaks
@@ -196,4 +431,1263 @@ fn session_peaks_accumulate_and_reset_on_restart() {
     assert_eq!(peaks.decode, None);
     assert_eq!(peaks.prefill, None);
     assert_eq!(peaks.decode_single, None);
+}
+
+#[test]
+fn histogram_bucket_without_le_is_skipped_not_fatal() {
+    let body = "\
+# TYPE m:lat histogram
+m:lat_count{mode=\"decode\"} 2
+m:lat_bucket{mode=\"decode\"} 1
+m:lat_bucket{mode=\"decode\",le=\"NaN\"} 5
+m:lat_bucket{mode=\"decode\",le=\"10\"} 2
+m:other_gauge 7
+";
+    let sample = parse(body).unwrap();
+    let key = key("m:lat", &[("mode", "decode")]);
+    let h = sample.hist.get(&key).expect("histogram family present");
+    // only the bucket with a usable `le` survives
+    assert_eq!(h.le, vec![10.0]);
+    assert_eq!(h.counts, vec![2.0]);
+    assert_eq!(h.count, 2);
+    assert_eq!(sample.simple.len(), 1);
+}
+
+#[test]
+fn interval_rejects_non_finite() {
+    use clap::Parser as _;
+    use sgtop::args::Args as _Args;
+    for bad in ["nan", "NaN", "inf", "-inf", "infinity"] {
+        let res = _Args::try_parse_from(["sgtop", &format!("--interval={bad}")]);
+        assert!(res.is_err(), "--interval {bad} must be rejected");
+        let msg = format!("{}", res.unwrap_err().render());
+        assert!(msg.contains("finite"), "error for {bad}: {msg}");
+    }
+    for ok in ["0.5", "10", "1.5"] {
+        assert!(
+            _Args::try_parse_from(["sgtop", "--interval", ok]).is_ok(),
+            "--interval {ok} must be accepted"
+        );
+    }
+}
+
+// ---- display hardening: non-finite gauges, pool visibility ----
+
+fn mamba_pool_sample(usage: Option<f64>) -> Sample {
+    let usage_line = match usage {
+        Some(v) => format!("sglang:mamba_usage {v}\n"),
+        None => String::new(),
+    };
+    parse(&format!(
+        "# TYPE sglang:mamba_used_tokens gauge\n\
+         sglang:mamba_used_tokens 8.0\n\
+         # TYPE sglang:mamba_available_tokens gauge\n\
+         sglang:mamba_available_tokens 8.0\n\
+         # TYPE sglang:mamba_usage gauge\n\
+         {usage_line}"
+    ))
+    .unwrap()
+}
+
+// NaN and ±Inf gauge values are unreadable data, not extreme readings:
+// skip the record like any other malformed line, leaving the series
+// absent so consumers see no data, never a maximal-looking value.
+#[test]
+fn non_finite_gauge_values_read_as_no_data() {
+    let body = "# TYPE m:g gauge\n\
+                m:g NaN\n\
+                m:g{r=\"0\"} +Inf\n\
+                m:g{r=\"1\"} -Inf\n\
+                m:g{r=\"2\"} 7.0\n";
+    let s = parse(body).unwrap();
+    assert_eq!(
+        s.gauge("m:g"),
+        Some(7.0),
+        "only the finite reading may survive"
+    );
+    assert_eq!(s.simple.len(), 1);
+}
+
+// A NaN reading inside a windowed series must produce the same derived
+// shape as the series being absent altogether: same gauge lookup,
+// same pool membership, same graph lane.
+#[test]
+fn nan_reading_in_a_windowed_series_has_the_shape_of_a_missing_sample() {
+    let t0 = Instant::now();
+    let mut h_nan = History::default();
+    h_nan.push(t0, mamba_pool_sample(Some(0.5)));
+    h_nan.push(
+        t0 + Duration::from_secs(1),
+        mamba_pool_sample(Some(f64::NAN)),
+    );
+    let mut h_missing = History::default();
+    h_missing.push(t0, mamba_pool_sample(Some(0.5)));
+    h_missing.push(t0 + Duration::from_secs(1), mamba_pool_sample(None));
+
+    let usage = |k: &SeriesKey| k.name == "sglang:mamba_usage";
+    assert_eq!(
+        h_nan.gauge_pred(usage),
+        h_missing.gauge_pred(usage),
+        "a non-finite reading must not look like a present value"
+    );
+
+    let d_nan = derive(&h_nan, 0).unwrap();
+    let d_missing = derive(&h_missing, 0).unwrap();
+    assert_eq!(
+        d_nan.pools.len(),
+        d_missing.pools.len(),
+        "pool membership must match the absent-series case"
+    );
+    assert_eq!(
+        d_nan.graphs.pool_mamba, d_missing.graphs.pool_mamba,
+        "pool graph lane must match the absent-series case"
+    );
+}
+
+// A completely full optional pool (zero available slots, all used) has
+// data and must keep rendering at exactly 100% usage.
+#[test]
+fn optional_pool_at_exactly_full_capacity_still_renders() {
+    let body = "\
+# TYPE sglang:mamba_used_tokens gauge
+sglang:mamba_used_tokens 16.0
+# TYPE sglang:mamba_available_tokens gauge
+sglang:mamba_available_tokens 0.0
+# TYPE sglang:mamba_usage gauge
+sglang:mamba_usage 1.0
+# TYPE sglang:swa_used_tokens gauge
+sglang:swa_used_tokens 16.0
+# TYPE sglang:swa_available_tokens gauge
+sglang:swa_available_tokens 0.0
+# TYPE sglang:swa_token_usage gauge
+sglang:swa_token_usage 1.0
+";
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, parse(body).unwrap());
+    h.push(t0 + Duration::from_secs(1), parse(body).unwrap());
+    let d = derive(&h, 0).unwrap();
+    let mamba = d
+        .pools
+        .iter()
+        .find(|p| p.name == "mamba")
+        .expect("full mamba pool must keep rendering");
+    assert_eq!(mamba.usage, 1.0);
+    let swa = d
+        .pools
+        .iter()
+        .find(|p| p.name == "SWA")
+        .expect("full SWA pool must keep rendering");
+    assert_eq!(swa.usage, 1.0);
+}
+
+// The visibility gate is "ever had data", not "ever existed": a pool
+// reporting zero capacity and zero usage stays hidden.
+#[test]
+fn optional_pool_that_never_had_data_stays_hidden() {
+    let body = "\
+# TYPE sglang:mamba_used_tokens gauge
+sglang:mamba_used_tokens 0.0
+# TYPE sglang:mamba_available_tokens gauge
+sglang:mamba_available_tokens 0.0
+# TYPE sglang:mamba_usage gauge
+sglang:mamba_usage 0.0
+";
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, parse(body).unwrap());
+    h.push(t0 + Duration::from_secs(1), parse(body).unwrap());
+    let d = derive(&h, 0).unwrap();
+    assert!(
+        d.pools.iter().all(|p| p.name != "mamba"),
+        "a pool with no data in the window must stay hidden"
+    );
+}
+
+// A usage-ratio gauge that blinks non-finite mid-window must not hide
+// a pool that has reported data: visibility follows the ever-had-data
+// rule, and the usage shown falls back to the latest in-window reading.
+#[test]
+fn pool_stays_visible_when_its_usage_gauge_blinks_non_finite() {
+    let t0 = Instant::now();
+    let live = "\
+# TYPE sglang:mamba_used_tokens gauge
+sglang:mamba_used_tokens 4.0
+# TYPE sglang:mamba_available_tokens gauge
+sglang:mamba_available_tokens 4.0
+# TYPE sglang:mamba_usage gauge
+sglang:mamba_usage 0.5
+";
+    let blink = live.replace("sglang:mamba_usage 0.5", "sglang:mamba_usage NaN");
+
+    // blink while the counts stay present in the newest scrape:
+    // the usage shown is the computed used/total ratio
+    let mut h_blink = History::default();
+    h_blink.push(t0, parse(live).unwrap());
+    h_blink.push(t0 + Duration::from_secs(1), parse(&blink).unwrap());
+    let d_blink = derive(&h_blink, 0).unwrap();
+    let mamba = d_blink
+        .pools
+        .iter()
+        .find(|p| p.name == "mamba")
+        .expect("a pool with in-window data must keep rendering through a usage-gauge blink");
+    assert_eq!(mamba.usage, 0.5, "usage must come from the computed ratio");
+
+    // blink with the newest scrape carrying no mamba gauges at all:
+    // the usage shown is the latest in-window usage reading
+    let absent = "# TYPE sglang:num_running_reqs gauge\nsglang:num_running_reqs 1.0\n";
+    let mut h_absent = History::default();
+    h_absent.push(t0, parse(live).unwrap());
+    h_absent.push(t0 + Duration::from_secs(1), parse(absent).unwrap());
+    let d_absent = derive(&h_absent, 0).unwrap();
+    let mamba_absent =
+        d_absent.pools.iter().find(|p| p.name == "mamba").expect(
+            "a pool with in-window data must keep rendering when the newest scrape omits it",
+        );
+    assert_eq!(
+        mamba_absent.usage, 0.5,
+        "usage must fall back to the prior in-window reading"
+    );
+}
+
+// ---- windowed-delta semantics: reappearance, label order, ladder pairing ----
+
+fn mix_without_decode(prefill: f64) -> Sample {
+    parse(&format!(
+        "# TYPE sglang:realtime_tokens_total counter\n\
+         sglang:realtime_tokens_total{{mode=\"prefill_compute\"}} {prefill}\n\
+         # TYPE sglang:num_running_reqs gauge\n\
+         sglang:num_running_reqs 4\n"
+    ))
+    .unwrap()
+}
+
+fn counter_with_gap(values: [Option<f64>; 5]) -> History {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    for (i, v) in values.iter().enumerate() {
+        let mut body = String::from("# TYPE m:other gauge\nm:other 1\n");
+        if let Some(v) = v {
+            body.push_str(&format!("# TYPE m:c counter\nm:c {v}\n"));
+        }
+        h.push(
+            t0 + Duration::from_secs(i as u64 * 10),
+            parse(&body).unwrap(),
+        );
+    }
+    h
+}
+
+// A counter that vanishes for one or more scrapes and later reappears
+// counts as a new series from the reappearance point. Pairing the first
+// reappearance sample with a pre-gap sample would fabricate a spike
+// (higher value) or a fake reset (lower value).
+#[test]
+fn reappearance_after_gap_is_not_paired_with_the_pre_gap_sample() {
+    let h = counter_with_gap([Some(100.0), Some(150.0), None, Some(160.0), Some(220.0)]);
+    let rate = h
+        .rate_sum(|k| k.name == "m:c", Duration::from_secs(60))
+        .unwrap();
+    // paired deltas 50 + 60 over 40s (the reappearance interval adds 0)
+    assert!((rate - 2.75).abs() < 1e-9, "rate was {rate}");
+}
+
+// A reappearance whose value is lower than the pre-gap reading follows
+// the same rule: no pairing across the gap, and the next interval
+// measures against the reappearance value itself.
+#[test]
+fn reappearance_after_gap_with_lower_value_starts_fresh() {
+    let h = counter_with_gap([Some(100.0), Some(150.0), None, Some(40.0), Some(90.0)]);
+    let rate = h
+        .rate_sum(|k| k.name == "m:c", Duration::from_secs(60))
+        .unwrap();
+    // paired deltas 50 + 50 over 40s
+    assert!((rate - 2.5).abs() < 1e-9, "rate was {rate}");
+}
+
+// Flagged intervals must be exactly the intervals whose earlier sample
+// lacks the series, and every other interval must keep its true delta.
+// The decoded rate vector below pins those positions exactly.
+#[test]
+fn reappearance_intervals_are_exactly_those_after_an_absent_predecessor() {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    // decode counter absent at entry 2, present everywhere else
+    h.push(t0, mix(0.0, 0.0));
+    h.push(t0 + Duration::from_secs(1), mix(10.0, 0.0));
+    h.push(t0 + Duration::from_secs(2), mix_without_decode(0.0));
+    h.push(t0 + Duration::from_secs(3), mix(30.0, 0.0));
+    h.push(t0 + Duration::from_secs(4), mix(60.0, 0.0));
+    let d = derive(&h, 0).unwrap();
+    // interval 2 (reappearance) contributes 0, the vanished interval has
+    // nothing to sum, and the others keep their true deltas
+    let expected = [10.0, 0.0, 0.0, 30.0];
+    assert_eq!(
+        d.graphs.decode.vals.len(),
+        expected.len(),
+        "decode lanes were {:?}",
+        d.graphs.decode.vals
+    );
+    for (i, (got, want)) in d.graphs.decode.vals.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "decode lane {i} was {got}, expected {want} (lanes {:?})",
+            d.graphs.decode.vals
+        );
+    }
+}
+
+// Session peaks must not record the fabricated rate of a reappearance
+// interval: the interval that brings the series back contributes no rate.
+#[test]
+fn reappearance_does_not_record_a_peak_spike() {
+    use sgtop::derive::{update_peaks, Peaks};
+
+    let mut h = History::default();
+    let mut peaks = Peaks::default();
+    let t0 = Instant::now();
+    h.push(t0, mix(0.0, 0.0));
+    h.push(t0 + Duration::from_secs(1), mix(100.0, 0.0));
+    update_peaks(&mut peaks, &h);
+    assert_eq!(peaks.decode, Some(100.0));
+    h.push(t0 + Duration::from_secs(2), mix_without_decode(0.0));
+    update_peaks(&mut peaks, &h);
+    h.push(t0 + Duration::from_secs(3), mix(400.0, 0.0));
+    update_peaks(&mut peaks, &h);
+    assert_eq!(
+        peaks.decode,
+        Some(100.0),
+        "the reappearance interval must not feed the session peak"
+    );
+}
+
+// Two scrapes of the same metric whose labels are emitted in different
+// orders are one series, not two: label order must not affect identity,
+// or the "new" series fabricates a full-value delta on its first pair.
+#[test]
+fn label_emit_order_does_not_fork_series_identity() {
+    let a = parse("# TYPE m:c counter\nm:c{a=\"x\",b=\"y\"} 100\n").unwrap();
+    let b = parse("# TYPE m:c counter\nm:c{b=\"y\",a=\"x\"} 150\n").unwrap();
+    let key_a = a.simple.keys().next().unwrap().clone();
+    assert!(
+        b.simple.contains_key(&key_a),
+        "reordered labels must resolve to the same series key"
+    );
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, a);
+    h.push(t0 + Duration::from_secs(10), b);
+    let rate = h
+        .rate_sum(|k| k.name == "m:c", Duration::from_secs(60))
+        .unwrap();
+    assert!((rate - 5.0).abs() < 1e-9, "rate was {rate}");
+}
+
+// Histogram bucket counts must pair on the `le` boundary value, never
+// on list position: a bucket inserted mid-ladder between two samples
+// shifts every later index pairing, and the shifted deltas can stay
+// non-negative, so only boundary-keyed pairing keeps the quantile sane.
+#[test]
+fn mid_ladder_bucket_insertion_pairs_quantiles_by_boundary() {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    let old_body = "# TYPE m:lat histogram\n\
+        m:lat_bucket{le=\"0.1\"} 2\nm:lat_bucket{le=\"1\"} 19\nm:lat_bucket{le=\"+Inf\"} 20\n\
+        m:lat_count 20\nm:lat_sum 9.0\n";
+    let new_body = "# TYPE m:lat histogram\n\
+        m:lat_bucket{le=\"0.1\"} 7\nm:lat_bucket{le=\"0.5\"} 19\n\
+        m:lat_bucket{le=\"1\"} 29\nm:lat_bucket{le=\"+Inf\"} 30\n\
+        m:lat_count 30\nm:lat_sum 14.0\n";
+    h.push(t0, parse(old_body).unwrap());
+    h.push(t0 + Duration::from_secs(1), parse(new_body).unwrap());
+    let p50 = h
+        .hist_quantile(|k| k.name == "m:lat", 0.5, Duration::from_secs(60))
+        .unwrap();
+    let p95 = h
+        .hist_quantile(|k| k.name == "m:lat", 0.95, Duration::from_secs(60))
+        .unwrap();
+    // shared-boundary window deltas: +5 at le=0.1, +10 at le=1
+    // p50 rank 5 sits exactly on the le=0.1 boundary, p95 rank 9.5
+    // interpolates inside the (0.1, 1] bucket
+    assert!((p50 - 0.1).abs() < 1e-9, "p50 was {p50}");
+    assert!((p95 - 0.91).abs() < 1e-9, "p95 was {p95}");
+}
+
+// A bucket with an `le` bound of NaN cannot be ordered, so parse must
+// drop it: a retained NaN bound wedges the boundary-keyed delta walk
+// and silently truncates deltas at later boundaries. The +Inf bound
+// is the standard top bucket and stays valid.
+#[test]
+fn nan_le_bound_is_dropped_and_quantiles_stay_sane() {
+    let old_body = "# TYPE m:lat histogram\n\
+        m:lat_bucket{le=\"0.1\"} 10\nm:lat_bucket{le=\"NaN\"} 15\n\
+        m:lat_bucket{le=\"1\"} 19\nm:lat_bucket{le=\"+Inf\"} 20\n\
+        m:lat_count 20\nm:lat_sum 9.0\n";
+    let new_body = "# TYPE m:lat histogram\n\
+        m:lat_bucket{le=\"0.1\"} 14\nm:lat_bucket{le=\"1\"} 29\n\
+        m:lat_bucket{le=\"+Inf\"} 30\nm:lat_count 30\nm:lat_sum 14.0\n";
+    let old = parse(old_body).unwrap();
+    let key = old.hist.keys().next().unwrap().clone();
+    let h = &old.hist[&key];
+    // only usable bounds survive: the NaN bound must not be stored
+    assert_eq!(h.le, vec![0.1, 1.0, f64::INFINITY]);
+    assert_eq!(h.counts, vec![10.0, 19.0, 20.0]);
+
+    let mut hist = History::default();
+    let t0 = Instant::now();
+    hist.push(t0, old);
+    hist.push(t0 + Duration::from_secs(1), parse(new_body).unwrap());
+    // shared-boundary deltas: +4 at le=0.1, +10 at le=1
+    // p50 rank 5 interpolates inside the (0.1, 1] bucket
+    let p50 = hist
+        .hist_quantile(|k| k.name == "m:lat", 0.5, Duration::from_secs(60))
+        .unwrap();
+    assert!((p50 - 0.25).abs() < 1e-9, "p50 was {p50}");
+}
+
+// ---- unified stall pass: one flag set feeds the banner and the graphs ----
+
+/// One scrape of the stall fixture holding decode and prefill
+/// counters, a running gauge, and an optional helper counter `m:c`.
+/// A None decode reading means an absent series: the shape left
+/// behind when the parse boundary drops a non-finite value.
+fn stall_sample(decode: Option<f64>, prefill: f64, running: f64, helper: Option<f64>) -> Sample {
+    let mut body = String::from("# TYPE sglang:realtime_tokens_total counter\n");
+    if let Some(v) = decode {
+        body.push_str(&format!(
+            "sglang:realtime_tokens_total{{mode=\"decode\"}} {v}\n"
+        ));
+    }
+    body.push_str(&format!(
+        "sglang:realtime_tokens_total{{mode=\"prefill_compute\"}} {prefill}\n\
+         # TYPE sglang:num_running_reqs gauge\n\
+         sglang:num_running_reqs {running}\n\
+         # TYPE m:c counter\n"
+    ));
+    if let Some(v) = helper {
+        body.push_str(&format!("m:c {v}\n"));
+    }
+    parse(&body).unwrap()
+}
+
+fn stall_history(samples: &[Sample]) -> History {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    for (i, s) in samples.iter().enumerate() {
+        h.push(t0 + Duration::from_secs(i as u64), s.clone());
+    }
+    h
+}
+
+// The flagged tick positions are exactly the intervals whose predecessor
+// sample lacks the decode series. An unreadable or absent reading is itself a gap:
+// the interval leading out of it is flagged outright while prefill
+// is being computed. The hero counters fold the same flags into their time budgets,
+// so banner counts and graph ticks can never disagree.
+// A counter whose only advance lands on the flagged interval pairs
+// nothing across the gap (zero real rate, no fabricated spike).
+// One that moves between normal intervals shows its rate.
+#[test]
+fn stall_ticks_equal_intervals_whose_predecessor_is_absent() {
+    let samples = [
+        stall_sample(Some(0.0), 0.0, 4.0, Some(10.0)),
+        stall_sample(Some(100.0), 0.0, 4.0, Some(10.0)),
+        stall_sample(None, 0.0, 4.0, None),
+        stall_sample(Some(140.0), 50.0, 4.0, Some(90.0)),
+        stall_sample(Some(240.0), 50.0, 4.0, Some(90.0)),
+    ];
+    let absent = stall_history(&samples);
+    // a NaN reading is dropped at the parse boundary, so it must flag
+    // identically to the series being absent altogether
+    let nan = stall_history(&[
+        stall_sample(Some(0.0), 0.0, 4.0, Some(10.0)),
+        stall_sample(Some(100.0), 0.0, 4.0, Some(10.0)),
+        stall_sample(Some(f64::NAN), 0.0, 4.0, None),
+        stall_sample(Some(140.0), 50.0, 4.0, Some(90.0)),
+        stall_sample(Some(240.0), 50.0, 4.0, Some(90.0)),
+    ]);
+
+    for h in [&absent, &nan] {
+        let d = derive(h, 0).unwrap();
+        assert_eq!(
+            d.graphs.stall,
+            vec![false, false, true, false],
+            "flags must mark exactly the interval leading out of the unreadable scrape"
+        );
+        // the hero counters fold the same flags: one flagged interval
+        // inside each untruncated budget, one second frozen
+        assert_eq!(d.stalls[0].count, 1);
+        assert_eq!(d.stalls[2].count, 1);
+        assert!((d.stalls[2].seconds - 1.0).abs() < 1e-9);
+    }
+    assert_eq!(
+        derive(&absent, 0).unwrap().graphs.stall,
+        derive(&nan, 0).unwrap().graphs.stall,
+        "a non-finite blink and an absent series must flag identically"
+    );
+
+    // the helper counter's only advance lands on the flagged interval:
+    // the per-pair absence rule pairs nothing there, so the real rate is zero
+    // (measured stillness, not the fabricated jump across the gap)
+    let helper_rate = absent.rate_sum(|k| k.name == "m:c", Duration::from_secs(60));
+    assert_eq!(helper_rate, Some(0.0), "helper rate was {helper_rate:?}");
+    // decode moves between normal intervals and shows its rate: 200
+    // tokens over the 4s span
+    let decode_rate = absent
+        .rate_sum(
+            |k| k.name == "sglang:realtime_tokens_total" && k.has_label("mode", "decode"),
+            Duration::from_secs(60),
+        )
+        .unwrap();
+    assert!((decode_rate - 50.0).abs() < 1e-9, "rate was {decode_rate}");
+}
+
+// A first appearance is not a stall: the decode series materializing
+// mid-window (cold start) has never collapsed, so no interval flags,
+// even while requests run and prefill computes throughout. Its leading
+// interval pairs nothing (rate 0 is absence), and no threshold arm
+// reads that absence as a measured collapse either.
+#[test]
+fn first_decode_appearance_is_not_a_stall() {
+    // prefill advances every interval, so the prefill-computing
+    // condition holds wherever the running count is positive
+    let h = stall_history(&[
+        stall_sample(None, 0.0, 4.0, None),
+        stall_sample(None, 50.0, 4.0, None),
+        stall_sample(Some(0.0), 100.0, 4.0, None),
+        stall_sample(Some(100.0), 150.0, 4.0, None),
+        stall_sample(Some(200.0), 200.0, 4.0, None),
+    ]);
+    let d = derive(&h, 0).unwrap();
+    assert_eq!(
+        d.graphs.stall,
+        vec![false, false, false, false],
+        "a first appearance must not flag: {:?}",
+        d.graphs.stall
+    );
+    // the busy fixture's own prefill lane confirms the condition held:
+    // 50 tokens/s on every interval after the first
+    assert_eq!(d.graphs.prefill.vals, vec![50.0, 50.0, 50.0, 50.0]);
+    assert_eq!(d.stalls[0].count, 0);
+    assert_eq!(d.stalls[2].count, 0);
+}
+
+// The stall bar is the median over the whole window, not the prefix
+// median at each interval: a collapse right at the start is flagged
+// by the graph ticks and the hero counters alike.
+#[test]
+fn stall_bar_is_the_full_window_median() {
+    let h = stall_history(&[
+        stall_sample(Some(0.0), 0.0, 4.0, None),
+        stall_sample(Some(0.0), 50.0, 4.0, None),
+        stall_sample(Some(100.0), 50.0, 4.0, None),
+        stall_sample(Some(200.0), 50.0, 4.0, None),
+    ]);
+    let d = derive(&h, 0).unwrap();
+    assert_eq!(d.graphs.stall, vec![true, false, false]);
+    assert_eq!(d.stalls[0].count, 1);
+}
+
+// Each interval is judged by the running count it had: a collapse
+// during an idle stretch is not flagged in hindsight by a later busy
+// reading.
+#[test]
+fn stall_flags_use_each_intervals_own_running_count() {
+    let h = stall_history(&[
+        stall_sample(Some(100.0), 0.0, 0.0, None),
+        stall_sample(Some(200.0), 0.0, 0.0, None),
+        stall_sample(Some(200.0), 60.0, 0.0, None),
+        stall_sample(Some(300.0), 60.0, 4.0, None),
+        stall_sample(Some(400.0), 60.0, 4.0, None),
+    ]);
+    let d = derive(&h, 0).unwrap();
+    assert_eq!(d.graphs.stall, vec![false, false, false, false]);
+    assert_eq!(d.stalls[0].count, 0);
+}
+
+// The cached window scan is rebuilt on every push, so the UI always
+// reads a scan matching the adjacent ring.
+#[test]
+fn cached_window_scan_tracks_the_ring() {
+    use sgtop::derive::scan_window;
+
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, stall_sample(Some(0.0), 0.0, 4.0, None));
+    assert!(h.scan().is_some(), "a push must populate the scan cache");
+    h.push(
+        t0 + Duration::from_secs(1),
+        stall_sample(Some(0.0), 50.0, 4.0, None),
+    );
+    h.push(
+        t0 + Duration::from_secs(2),
+        stall_sample(Some(100.0), 50.0, 4.0, None),
+    );
+    assert_eq!(h.scan().unwrap().stall, scan_window(&h).stall);
+    // eviction must not desynchronize the cache: pushing RING_CAP more
+    // samples evicts the oldest entries, and the cached scan still
+    // matches a fresh walk
+    for i in 0..(RING_CAP as u32) {
+        h.push(
+            t0 + Duration::from_secs(3 + i as u64),
+            stall_sample(Some(100.0 + f64::from(i)), 50.0, 4.0, None),
+        );
+    }
+    assert_eq!(
+        h.scan().unwrap().decode.vals.len(),
+        h.window_entries(Duration::from_secs(60)).len() - 1
+    );
+}
+
+// ---- busy-server fixture: a loaded server, generated in code ----
+
+/// Decode counter state the busy fixture carries at scrape `step`:
+/// 40 tokens/s for the first 5 steps, then 80 tokens/s. Counters
+/// advance one scrape interval (1s) per step, so window rates
+/// and histogram deltas stay hand-computable.
+fn busy_decode_counter(step: u32) -> f64 {
+    if step <= 5 {
+        40.0 * f64::from(step)
+    } else {
+        200.0 + 80.0 * f64::from(step - 5)
+    }
+}
+
+/// What the busy fixture's decode counter line holds at one scrape:
+/// a normal reading, no line at all, or a non-finite reading. Absent
+/// is the shape an unreadable value leaves after the parse boundary
+/// drops it.
+#[derive(Clone, Copy, Debug)]
+enum BusyDecode {
+    Normal,
+    Absent,
+    NonFinite,
+}
+
+/// Cumulative histogram lines for one family: `bounds` lists the finite
+/// `le` bounds, `cum` the cumulative count through each bound. A final
+/// `cum` entry covers the +Inf bucket, so `cum` always has one entry
+/// more than `bounds` holds.
+fn hist_lines(name: &str, bounds: &[f64], cum: &[f64]) -> String {
+    let mut s = format!("# TYPE {name} histogram\n");
+    for (le, c) in bounds.iter().zip(cum) {
+        s.push_str(&format!("{name}_bucket{{le=\"{le}\"}} {c}\n"));
+    }
+    let total = cum[cum.len() - 1];
+    s.push_str(&format!("{name}_bucket{{le=\"+Inf\"}} {total}\n"));
+    s.push_str(&format!("{name}_count {total}\n"));
+    s.push_str(&format!("{name}_sum {}\n", total * 0.1));
+    s
+}
+
+/// One scrape of a loaded server: running slots above zero, a queue,
+/// tokens advancing, non-trivial histogram traffic, all four pool
+/// families, and the L2/health counters. Every counter advances
+/// linearly in `step` (its per-second rate is the per-step delta),
+/// so every derived number has a hand-computable expectation.
+fn busy_body(step: u32, decode: BusyDecode) -> String {
+    let s = f64::from(step);
+    let decode_line = match decode {
+        BusyDecode::Normal => format!(
+            "sglang:realtime_tokens_total{{mode=\"decode\"}} {}\n",
+            busy_decode_counter(step)
+        ),
+        BusyDecode::NonFinite => "sglang:realtime_tokens_total{mode=\"decode\"} NaN\n".into(),
+        BusyDecode::Absent => String::new(),
+    };
+    format!(
+        "# TYPE sglang:realtime_tokens_total counter\n\
+         {decode_line}\
+         sglang:realtime_tokens_total{{mode=\"prefill_compute\"}} {}\n\
+         # TYPE sglang:num_running_reqs gauge\n\
+         sglang:num_running_reqs{{engine_type=\"unified\",model_name=\"busy-model\"}} 4\n\
+         # TYPE sglang:num_queue_reqs gauge\n\
+         sglang:num_queue_reqs 2\n\
+         # TYPE sglang:num_prefill_bootstrap_queue_reqs gauge\n\
+         sglang:num_prefill_bootstrap_queue_reqs 1\n\
+         # TYPE sglang:num_prefill_inflight_queue_reqs gauge\n\
+         sglang:num_prefill_inflight_queue_reqs 2\n\
+         # TYPE sglang:num_decode_prealloc_queue_reqs gauge\n\
+         sglang:num_decode_prealloc_queue_reqs 3\n\
+         # TYPE sglang:num_decode_transfer_queue_reqs gauge\n\
+         sglang:num_decode_transfer_queue_reqs 4\n\
+         # TYPE sglang:num_grammar_queue_reqs gauge\n\
+         sglang:num_grammar_queue_reqs 5\n\
+         # TYPE sglang:token_usage gauge\n\
+         sglang:token_usage 0.8\n\
+         # TYPE sglang:kv_used_tokens gauge\n\
+         sglang:kv_used_tokens 8000\n\
+         # TYPE sglang:max_total_num_tokens gauge\n\
+         sglang:max_total_num_tokens 10000\n\
+         # TYPE sglang:mamba_used_tokens gauge\n\
+         sglang:mamba_used_tokens 200\n\
+         # TYPE sglang:mamba_available_tokens gauge\n\
+         sglang:mamba_available_tokens 800\n\
+         # TYPE sglang:mamba_usage gauge\n\
+         sglang:mamba_usage 0.2\n\
+         # TYPE sglang:swa_used_tokens gauge\n\
+         sglang:swa_used_tokens 100\n\
+         # TYPE sglang:swa_available_tokens gauge\n\
+         sglang:swa_available_tokens 300\n\
+         # TYPE sglang:swa_token_usage gauge\n\
+         sglang:swa_token_usage 0.25\n\
+         # TYPE sglang:hicache_host_total_tokens gauge\n\
+         sglang:hicache_host_total_tokens 50000\n\
+         # TYPE sglang:hicache_host_used_tokens gauge\n\
+         sglang:hicache_host_used_tokens 40000\n\
+         # TYPE sglang:cache_hit_rate gauge\n\
+         sglang:cache_hit_rate 0.73\n\
+         # TYPE sglang:spec_accept_rate gauge\n\
+         sglang:spec_accept_rate 0.65\n\
+         # TYPE sglang:spec_accept_length gauge\n\
+         sglang:spec_accept_length 3.25\n\
+         # TYPE sglang:gen_throughput gauge\n\
+         sglang:gen_throughput 123.4\n\
+         # TYPE sglang:new_token_ratio gauge\n\
+         sglang:new_token_ratio 0.35\n\
+         # TYPE sglang:decode_sum_seq_lens gauge\n\
+         sglang:decode_sum_seq_lens 40\n\
+         # TYPE sglang:http_requests_active gauge\n\
+         sglang:http_requests_active 3\n\
+         # TYPE sglang:http_responses_total counter\n\
+         sglang:http_responses_total{{status_code=\"200\"}} {}\n\
+         sglang:http_responses_total{{status_code=\"503\"}} {}\n\
+         # TYPE sglang:evicted_tokens_total counter\n\
+         sglang:evicted_tokens_total {}\n\
+         # TYPE sglang:num_retracted_reqs counter\n\
+         sglang:num_retracted_reqs {}\n\
+         # TYPE sglang:hicache_backup_tokens_total counter\n\
+         sglang:hicache_backup_tokens_total {}\n\
+         # TYPE sglang:load_back_tokens_total counter\n\
+         sglang:load_back_tokens_total {}\n\
+         # TYPE sglang:hicache_dropped_tokens_total counter\n\
+         sglang:hicache_dropped_tokens_total 0\n\
+         # TYPE sglang:prefill_effective_tokens_total counter\n\
+         sglang:prefill_effective_tokens_total{{mode=\"device_hit\"}} {}\n\
+         sglang:prefill_effective_tokens_total{{mode=\"host_hit\"}} {}\n\
+         sglang:prefill_effective_tokens_total{{mode=\"miss\"}} {}\n\
+         # TYPE sglang:process_cpu_seconds_total counter\n\
+         sglang:process_cpu_seconds_total{{component=\"tokenizer\"}} {}\n\
+         sglang:process_cpu_seconds_total{{component=\"detokenizer\"}} {}\n\
+         # TYPE sglang:scheduler_process_cpu_seconds_total counter\n\
+         sglang:scheduler_process_cpu_seconds_total {}\n\
+         {}{}{}{}{}",
+        100.0 * s,
+        10.0 * s,
+        2.0 * s,
+        5.0 * s,
+        1.0 * s,
+        25.0 * s,
+        15.0 * s,
+        60.0 * s,
+        30.0 * s,
+        10.0 * s,
+        0.5 * s,
+        0.3 * s,
+        0.8 * s,
+        // ttft: +2 obs <= 0.1, +3 in (0.1, 1], +1 in (1, 10] per step
+        hist_lines(
+            "sglang:time_to_first_token_seconds",
+            &[0.1, 1.0, 10.0],
+            &[2.0 * s, 5.0 * s, 6.0 * s, 6.0 * s],
+        ),
+        // itl: +2 obs per finite bucket per step
+        hist_lines(
+            "sglang:inter_token_latency_seconds",
+            &[0.02, 0.1, 1.0],
+            &[2.0 * s, 4.0 * s, 6.0 * s, 6.0 * s],
+        ),
+        // e2e: +1 <= 0.5, +3 in (0.5, 2], +2 in (2, 8] per step
+        hist_lines(
+            "sglang:e2e_request_latency_seconds",
+            &[0.5, 2.0, 8.0],
+            &[1.0 * s, 4.0 * s, 6.0 * s, 6.0 * s],
+        ),
+        // queue time: +4 <= 0.05, +2 in (0.05, 0.5] per step
+        hist_lines(
+            "sglang:queue_time_seconds",
+            &[0.05, 0.5],
+            &[4.0 * s, 6.0 * s, 6.0 * s],
+        ),
+        // prompt length: +1 <= 128, +2 in (128, 512], +3 in (512, 2048]
+        hist_lines(
+            "sglang:prompt_tokens_histogram",
+            &[128.0, 512.0, 2048.0],
+            &[1.0 * s, 3.0 * s, 6.0 * s, 6.0 * s],
+        ),
+    )
+}
+
+/// A busy server scraped once per second for `steps` steps.
+fn busy_history(steps: usize) -> History {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    for i in 0..steps {
+        h.push(
+            t0 + Duration::from_secs(i as u64),
+            parse(&busy_body(i as u32, BusyDecode::Normal)).unwrap(),
+        );
+    }
+    h
+}
+
+fn busy_derived() -> sgtop::derive::Derived {
+    derive(&busy_history(6), 2).unwrap()
+}
+
+// The headline identity lines come from the running-count series labels,
+// so a fixture whose labels differ from the live exporter still pins
+// the label-extraction path.
+#[test]
+fn busy_server_names_model_and_engine_from_series_labels() {
+    let d = busy_derived();
+    assert_eq!(d.model, "busy-model");
+    assert_eq!(d.engine, "unified");
+}
+
+// The focused window rides through derive untouched, so the UI's window
+// switch lands on the same number derive computed.
+#[test]
+fn window_focus_passes_through_derive() {
+    for focus in 0..3 {
+        let d = derive(&busy_history(6), focus).unwrap();
+        assert_eq!(d.window_focus, focus);
+    }
+}
+
+// RUNNING is the running count of the latest scrape, not an average
+// over the window: an engine that just got calmer reads the calm number.
+#[test]
+fn running_reports_the_latest_scrape() {
+    let d = busy_derived();
+    assert_eq!(d.running, Some(4.0));
+}
+
+// QUEUE is the latest scrape's waiting count.
+#[test]
+fn queue_reports_the_latest_scrape() {
+    let d = busy_derived();
+    assert_eq!(d.queue, Some(2.0));
+}
+
+// Each subqueue reads its own gauge from the latest scrape.
+#[test]
+fn subqueue_gauges_read_the_latest_scrape() {
+    let d = busy_derived();
+    let expected = [
+        ("prefill bootstrap", 1.0),
+        ("prefill inflight", 2.0),
+        ("decode prealloc", 3.0),
+        ("decode transfer", 4.0),
+        ("grammar", 5.0),
+    ];
+    assert_eq!(d.subqueues.len(), expected.len());
+    for ((name, got), (want_name, want)) in d.subqueues.iter().zip(expected) {
+        assert_eq!(*name, want_name);
+        assert_eq!(*got, Some(want), "subqueue {name} was {got:?}");
+    }
+}
+
+// The three rate windows see different slices of a rate change: the 5s
+// window holds only the fast interval, the 15s and 60s windows average
+// the slow first half in. Deltas are 40 tokens/s for steps 1-5 and 80
+// after, so 5s reads 400/5 = 80 and the full 10s span reads 600/10 = 60.
+#[test]
+fn decode_rates_span_all_three_windows() {
+    let d = derive(&busy_history(11), 2).unwrap();
+    assert_eq!(d.decode_rate[0], Some(80.0));
+    assert_eq!(d.decode_rate[1], Some(60.0));
+    assert_eq!(d.decode_rate[2], Some(60.0));
+}
+
+// The instant decode rate is the most recent scrape interval's rate,
+// not a windowed average: with the last interval at 80 tokens/s,
+// the instant reads 80, while the 60s window averages
+// the slower first half to 60.
+#[test]
+fn decode_instant_is_the_most_recent_interval() {
+    let d = derive(&busy_history(11), 2).unwrap();
+    assert_eq!(d.decode_instant, Some(80.0));
+}
+
+// Prefill runs at a constant 100 tokens/s in the fixture, so all three
+// windows agree with the instant rate.
+#[test]
+fn prefill_rates_span_all_three_windows() {
+    let d = busy_derived();
+    assert_eq!(d.prefill_rate[0], Some(100.0));
+    assert_eq!(d.prefill_rate[1], Some(100.0));
+    assert_eq!(d.prefill_rate[2], Some(100.0));
+    assert_eq!(d.prefill_instant, Some(100.0));
+}
+
+// The pool rows carry the usage ratio plus the engine-reported absolute
+// counts, with the unit saying what the counts count.
+#[test]
+fn pool_rows_carry_usage_counts_and_units() {
+    let d = busy_derived();
+    let find = |name: &str| {
+        d.pools
+            .iter()
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("pool {name} missing"))
+    };
+    let kv = find("KV");
+    assert_eq!(kv.usage, 0.8);
+    assert_eq!(kv.used, Some(8000.0));
+    assert_eq!(kv.total, Some(10000.0));
+    assert_eq!(kv.unit, "tokens");
+    let mamba = find("mamba");
+    assert_eq!(mamba.usage, 0.2);
+    assert_eq!(mamba.used, Some(200.0));
+    assert_eq!(mamba.total, Some(1000.0));
+    assert_eq!(mamba.unit, "slots");
+    let swa = find("SWA");
+    assert_eq!(swa.usage, 0.25);
+    assert_eq!(swa.unit, "slots");
+    let host = find("host");
+    assert_eq!(host.usage, 0.8);
+    assert_eq!(host.used, Some(40000.0));
+    assert_eq!(host.total, Some(50000.0));
+    assert_eq!(host.unit, "tokens");
+}
+
+// The pool graph lanes recompute the ratios from raw counts, so a graph
+// tick can never disagree with the pool row above it.
+#[test]
+fn pool_graph_lanes_match_the_pool_rows() {
+    let d = busy_derived();
+    assert_eq!(d.graphs.pool_kv, vec![0.8; 5]);
+    assert_eq!(d.graphs.pool_mamba, vec![0.2; 5]);
+    assert_eq!(d.graphs.pool_swa, vec![0.25; 5]);
+    assert_eq!(d.graphs.pool_host, vec![0.8; 5]);
+}
+
+#[test]
+fn cache_hit_rate_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().cache_hit, Some(0.73));
+}
+
+#[test]
+fn spec_accept_rate_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().spec_accept, Some(0.65));
+}
+
+#[test]
+fn spec_accept_length_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().spec_accept_len, Some(3.25));
+}
+
+// TTFT quantiles from window bucket deltas, hand-computed. Window
+// deltas: 10 obs <= 0.1, 15 in (0.1, 1], 5 in (1, 10], total 30.
+// p50 rank 15:  0.1 + 5/15 * 0.9 = 0.4
+// p95 rank 28.5: 1 + 3.5/5 * 9 = 7.3
+// p99 rank 29.7: 1 + 4.7/5 * 9 = 9.46
+#[test]
+fn ttft_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    let q = &d.ttft[2];
+    assert!((q.p50.unwrap() - 0.4).abs() < 1e-9, "p50 was {:?}", q.p50);
+    assert!((q.p95.unwrap() - 7.3).abs() < 1e-9, "p95 was {:?}", q.p95);
+    assert!((q.p99.unwrap() - 9.46).abs() < 1e-9, "p99 was {:?}", q.p99);
+}
+
+// ITL deltas over the window: 10 obs <= 0.02, 10 more in (0.02, 0.1],
+// and 10 in (0.1, 1].
+// p50 rank 15: 0.02 + 5/10 * 0.08 = 0.06
+// p95 rank 28.5: 0.1 + 8.5/10 * 0.9 = 0.865
+// p99 rank 29.7: 0.1 + 9.7/10 * 0.9 = 0.973
+#[test]
+fn itl_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    let q = &d.itl[2];
+    assert!((q.p50.unwrap() - 0.06).abs() < 1e-9, "p50 was {:?}", q.p50);
+    assert!((q.p95.unwrap() - 0.865).abs() < 1e-9, "p95 was {:?}", q.p95);
+    assert!((q.p99.unwrap() - 0.973).abs() < 1e-9, "p99 was {:?}", q.p99);
+}
+
+// E2E deltas: 5 obs <= 0.5, 15 in (0.5, 2], 10 in (2, 8].
+// p50 rank 15: 0.5 + 10/15 * 1.5 = 1.5
+// p95 rank 28.5: 2 + 8.5/10 * 6 = 7.1
+// p99 rank 29.7: 2 + 9.7/10 * 6 = 7.82
+#[test]
+fn e2e_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    let q = &d.e2e[2];
+    assert!((q.p50.unwrap() - 1.5).abs() < 1e-9, "p50 was {:?}", q.p50);
+    assert!((q.p95.unwrap() - 7.1).abs() < 1e-9, "p95 was {:?}", q.p95);
+    assert!((q.p99.unwrap() - 7.82).abs() < 1e-9, "p99 was {:?}", q.p99);
+}
+
+// Queue-time deltas: 20 obs <= 0.05, 10 in (0.05, 0.5].
+// p50 rank 15 sits in the first bucket, which starts at 0:
+// 15/20 * 0.05 = 0.0375
+// p95 rank 28.5: 0.05 + 8.5/10 * 0.45 = 0.4325
+// p99 rank 29.7: 0.05 + 9.7/10 * 0.45 = 0.4865
+#[test]
+fn queue_time_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    let q = &d.queue_time[2];
+    assert!(
+        (q.p50.unwrap() - 0.0375).abs() < 1e-9,
+        "p50 was {:?}",
+        q.p50
+    );
+    assert!(
+        (q.p95.unwrap() - 0.4325).abs() < 1e-9,
+        "p95 was {:?}",
+        q.p95
+    );
+    assert!(
+        (q.p99.unwrap() - 0.4865).abs() < 1e-9,
+        "p99 was {:?}",
+        q.p99
+    );
+}
+
+// Prompt-length deltas: 5 obs <= 128, 10 in (128, 512], then 15 more
+// in (512, 2048]. p50 rank 15 lands exactly on the 512 boundary.
+// p95 rank 28.5: 512 + 13.5/15 * 1536 = 1894.4.
+#[test]
+fn prompt_len_quantiles_match_hand_computed_values() {
+    let d = busy_derived();
+    assert_eq!(d.prompt_len_p50, Some(512.0));
+    assert!((d.prompt_len_p95.unwrap() - 1894.4).abs() < 1e-9);
+}
+
+// The stall banner stays silent on a uniformly busy server: decode well
+// above a quarter of the window median, prefill computing, nothing
+// frozen in any window.
+#[test]
+fn busy_server_has_no_stalls_in_any_window() {
+    let d = busy_derived();
+    for (i, s) in d.stalls.iter().enumerate() {
+        assert_eq!(s.count, 0, "window {i} counted {s:?}");
+        assert_eq!(s.seconds, 0.0);
+    }
+}
+
+// A decode reading dropped mid-window is a gap rather than a collapse:
+// the interval leading out of the gap is flagged
+// (running > 0, prefill computing, rate 0), the interval into the gap
+// is not, and a NaN reading flags identically because the parse boundary
+// dropped it before the scan ever saw it.
+#[test]
+fn stall_banner_counts_one_frozen_second_per_gap() {
+    for variant in [BusyDecode::Absent, BusyDecode::NonFinite] {
+        let mut h = History::default();
+        let t0 = Instant::now();
+        for i in 0..6u32 {
+            let decode = if i == 2 { variant } else { BusyDecode::Normal };
+            h.push(
+                t0 + Duration::from_secs(u64::from(i)),
+                parse(&busy_body(i, decode)).unwrap(),
+            );
+        }
+        let d = derive(&h, 2).unwrap();
+        assert_eq!(
+            d.graphs.stall,
+            vec![false, false, true, false, false],
+            "flags for {variant:?} were {:?}",
+            d.graphs.stall
+        );
+        assert_eq!(d.stalls[2].count, 1);
+        assert!((d.stalls[2].seconds - 1.0).abs() < 1e-9);
+    }
+}
+
+#[test]
+fn evict_rate_counts_evicted_tokens_per_second() {
+    assert_eq!(busy_derived().evict_rate, Some(5.0));
+}
+
+#[test]
+fn retract_rate_counts_retracted_requests_per_second() {
+    assert_eq!(busy_derived().retract_rate, Some(1.0));
+}
+
+// Only the 503 series feeds the 503 rate: a busy 200 series in the same
+// family must not leak into it.
+#[test]
+fn http_503_rate_isolates_the_503_series() {
+    assert_eq!(busy_derived().http_503_rate, Some(2.0));
+}
+
+#[test]
+fn http_active_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().http_active, Some(3.0));
+}
+
+#[test]
+fn gen_throughput_gauge_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().gen_throughput_gauge, Some(123.4));
+}
+
+// Device and host hit rates split their own modes against the whole
+// family's total: 60 + 30 + 10 tokens/s, so device reads 0.6
+// and host reads 0.3.
+#[test]
+fn l2_hit_rates_split_device_and_host_tiers() {
+    let d = busy_derived();
+    assert!((d.l2_device.unwrap() - 0.6).abs() < 1e-9);
+    assert!((d.l2_host.unwrap() - 0.3).abs() < 1e-9);
+}
+
+// Backup and load-back report their tokens/s, and a dropped-tokens
+// counter that exists but never moves reads as a present zero
+// (work tracked, none lost), not as missing data.
+#[test]
+fn l2_traffic_rates_report_backup_load_and_drop() {
+    let d = busy_derived();
+    assert_eq!(d.l2_wb, Some(25.0));
+    assert_eq!(d.l2_rb, Some(15.0));
+    assert_eq!(d.l2_drop, Some(0.0));
+}
+
+#[test]
+fn new_token_ratio_reads_the_latest_gauge() {
+    assert_eq!(busy_derived().new_token_ratio, Some(0.35));
+}
+
+// Average generation length divides the running requests' total
+// decoded length by the running count of the latest scrape
+// (running now): 40 tokens across 4 requests reads 10.
+#[test]
+fn gen_progress_averages_over_the_requests_running_now() {
+    assert_eq!(busy_derived().gen_progress, Some(10.0));
+}
+
+#[test]
+fn cpu_tokenizer_rate_counts_seconds_per_second() {
+    assert_eq!(busy_derived().cpu_tokenizer, Some(0.5));
+}
+
+#[test]
+fn cpu_detokenizer_rate_counts_seconds_per_second() {
+    assert_eq!(busy_derived().cpu_detokenizer, Some(0.3));
+}
+
+#[test]
+fn cpu_scheduler_rate_counts_seconds_per_second() {
+    assert_eq!(busy_derived().cpu_scheduler, Some(0.8));
+}
+
+// The graph lanes replay the fixture's per-interval rates: 40 tokens/s
+// of decode and 100 of prefill across all five intervals, no presence
+// flags, one second per interval.
+#[test]
+fn busy_graph_lanes_replay_the_intervals() {
+    let d = busy_derived();
+    assert_eq!(d.graphs.decode.vals, vec![40.0; 5]);
+    assert_eq!(d.graphs.prefill.vals, vec![100.0; 5]);
+    assert_eq!(d.graphs.decode.absent_old, vec![false; 5]);
+    assert_eq!(d.graphs.decode.absent_new, vec![false; 5]);
+    assert_eq!(d.graphs.dt, vec![1.0; 5]);
+}
+
+// Each graph lane divides its interval's decode rate by the running
+// count at that interval's later sample, never by the latest scrape's
+// count. One shared history pins both semantics: the fixture carries
+// 4 running requests at its first sample, then 8 at the second,
+// so lane one reads 5 (40/8) while headline RUNNING
+// and the generation average read the latest count, 4.
+#[test]
+fn per_stream_uses_the_running_count_of_its_own_interval() {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    for (i, running) in [4.0, 8.0, 4.0, 4.0].iter().enumerate() {
+        let body = format!(
+            "# TYPE sglang:realtime_tokens_total counter\n\
+             sglang:realtime_tokens_total{{mode=\"decode\"}} {}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs {running}\n\
+             # TYPE sglang:decode_sum_seq_lens gauge\n\
+             sglang:decode_sum_seq_lens 40\n",
+            40.0 * i as f64
+        );
+        h.push(t0 + Duration::from_secs(i as u64), parse(&body).unwrap());
+    }
+    let d = derive(&h, 2).unwrap();
+    assert_eq!(d.graphs.decode.vals, vec![40.0; 3]);
+    assert_eq!(d.graphs.per_stream, vec![Some(5.0), Some(10.0), Some(10.0)]);
+    assert_eq!(d.running, Some(4.0));
+    assert_eq!(d.gen_progress, Some(10.0));
+}
+
+// Missing decode data must not read as a collapse. The per-stream
+// lane stays empty when the decode series is missing on either side,
+// even while requests ran throughout. A non-finite reading behaves
+// identically, because the parse boundary drops it before the scan
+// sees the series. The headline window rate stays gap-aware.
+#[test]
+fn per_stream_stores_no_speed_when_decode_data_is_missing() {
+    for variant in [BusyDecode::Absent, BusyDecode::NonFinite] {
+        let mut h = History::default();
+        let t0 = Instant::now();
+        for i in 0..6u32 {
+            let decode = if i == 2 { variant } else { BusyDecode::Normal };
+            h.push(
+                t0 + Duration::from_secs(u64::from(i)),
+                parse(&busy_body(i, decode)).unwrap(),
+            );
+        }
+        let d = derive(&h, 2).unwrap();
+        // intervals touching the missing sample pair nothing; healthy
+        // intervals around them read 40 tok/s across 4 requests
+        assert_eq!(
+            d.graphs.per_stream,
+            vec![Some(10.0), None, None, Some(10.0), Some(10.0)],
+            "per-stream speeds for {variant:?} were {:?}",
+            d.graphs.per_stream
+        );
+        // running was positive across the whole window, so the Nones
+        // are absence, not idleness
+        assert_eq!(d.running, Some(4.0));
+        // the headline rate pairs only healthy intervals: 3 x 40 tokens
+        // over the 5s span
+        assert_eq!(d.decode_rate[2], Some(24.0));
+    }
+}
+
+// Session peaks only ever move up while one engine process runs.
+// Each scrape folds max(existing, new rate) into the running peaks.
+// Deltas here climb 40, 80, 120, 160, then drop to 20, and the peaks
+// must stay at the 160 interval.
+#[test]
+fn session_peaks_only_grow_until_a_counter_reset() {
+    use sgtop::derive::{update_peaks, Peaks};
+
+    let decode_values = [0.0, 40.0, 120.0, 240.0, 400.0, 420.0];
+    let mut h = History::default();
+    let mut peaks = Peaks::default();
+    let t0 = Instant::now();
+    let mut seen_decode = Vec::new();
+    for (i, v) in decode_values.iter().enumerate() {
+        let body = format!(
+            "# TYPE sglang:realtime_tokens_total counter\n\
+             sglang:realtime_tokens_total{{mode=\"decode\"}} {v}\n\
+             sglang:realtime_tokens_total{{mode=\"prefill_compute\"}} {}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 4\n",
+            100.0 * i as f64
+        );
+        h.push(t0 + Duration::from_secs(i as u64), parse(&body).unwrap());
+        update_peaks(&mut peaks, &h);
+        seen_decode.push(peaks.decode);
+        if i > 0 {
+            assert_eq!(peaks.prefill, Some(100.0), "prefill peak moved at step {i}");
+        }
+    }
+    assert_eq!(
+        seen_decode,
+        vec![
+            None,
+            Some(40.0),
+            Some(80.0),
+            Some(120.0),
+            Some(160.0),
+            Some(160.0)
+        ]
+    );
+    assert_eq!(peaks.decode_single, Some(40.0)); // 160 tok/s across 4 requests
 }

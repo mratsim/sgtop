@@ -4,12 +4,10 @@ use std::time::{Duration, Instant};
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::{Line, Span};
 use ratatui::symbols::Marker;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Line as CLine};
-use ratatui::widgets::{
-    Block, Borders, BorderType, Paragraph,
-};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::args::Args;
@@ -29,6 +27,8 @@ pub struct Ui {
     pub graphs_on: bool,
     pub window_focus: usize,
     pub paused_since: Option<Instant>,
+    /// `--insecure` is active: flagged in the header so unverified TLS is visible
+    pub insecure: bool,
     pub overlay: Overlay,
     pub scroll: u16,
     pub interval: f64,
@@ -53,6 +53,7 @@ impl Ui {
             graphs_on: true,
             window_focus: 2,
             paused_since: None,
+            insecure: args.insecure,
             overlay: Overlay::None,
             scroll: 0,
             interval: args.interval.clamp(0.5, 10.0),
@@ -99,9 +100,7 @@ fn handle_key(ui: &mut Ui, shared: &Arc<Shared>, code: crossterm::event::KeyCode
             false
         }
         Char('c') => {
-            let auto = ui
-                .compact
-                .unwrap_or_else(auto_compact);
+            let auto = ui.compact.unwrap_or_else(auto_compact);
             ui.compact = Some(!auto);
             false
         }
@@ -187,12 +186,18 @@ pub fn draw(f: &mut Frame, ui: &Ui, shared: &Arc<Shared>) {
         a.height < FULL_MIN_ROWS || a.width < FULL_MIN_COLS
     });
 
-    let mut constraints: Vec<Constraint> =
-        vec![Constraint::Length(1), Constraint::Length(if compact { 3 } else { 5 })];
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(1),
+        Constraint::Length(if compact { 3 } else { 5 }),
+    ];
     let mut graph_i: Option<usize> = None;
     if ui.graphs_on {
         graph_i = Some(constraints.len());
-        constraints.push(if compact { Constraint::Min(3) } else { Constraint::Min(7) });
+        constraints.push(if compact {
+            Constraint::Min(3)
+        } else {
+            Constraint::Min(7)
+        });
     }
     let lat_i = constraints.len();
     constraints.push(Constraint::Length(if compact { 5 } else { 8 }));
@@ -220,7 +225,15 @@ pub fn draw(f: &mut Frame, ui: &Ui, shared: &Arc<Shared>) {
         }
     }
     draw_latency(f, ui, t, chunks[lat_i], d.as_ref(), compact);
-    draw_detail(f, ui, t, chunks[det_i], d.as_ref(), compact, &shared.peaks.lock().unwrap());
+    draw_detail(
+        f,
+        ui,
+        t,
+        chunks[det_i],
+        d.as_ref(),
+        compact,
+        &shared.peaks.lock().unwrap(),
+    );
 
     match ui.overlay {
         Overlay::None => {}
@@ -262,7 +275,10 @@ fn banner(f: &mut Frame, area: Rect, msg: String, color: ratatui::style::Color) 
         width: area.width,
         height: 1,
     };
-    let line = Line::from(Span::styled(msg, Style::new().fg(color).add_modifier(Modifier::BOLD)));
+    let line = Line::from(Span::styled(
+        msg,
+        Style::new().fg(color).add_modifier(Modifier::BOLD),
+    ));
     f.render_widget(Paragraph::new(line), area);
 }
 
@@ -287,13 +303,22 @@ fn draw_header(
             Style::new().fg(t.fg),
         ));
         if let Some(up) = uptime {
-            spans.push(Span::styled(format!(" · up {}", fmt_dur(up)), Style::new().fg(t.dim)));
+            spans.push(Span::styled(
+                format!(" · up {}", fmt_dur(up)),
+                Style::new().fg(t.dim),
+            ));
         }
     }
     spans.push(Span::styled(
         format!(" · poll {:.1}s", ui.interval),
         Style::new().fg(t.dim),
     ));
+    if ui.insecure {
+        spans.push(Span::styled(
+            " · \u{26a0} insecure TLS",
+            Style::new().fg(t.warn),
+        ));
+    }
     if let Some(a) = age {
         if a > Duration::from_secs(2) {
             spans.push(Span::styled(
@@ -302,20 +327,16 @@ fn draw_header(
             ));
         }
     }
-    spans.push(Span::styled("  [? help · e explain]", Style::new().fg(t.dim)));
+    spans.push(Span::styled(
+        "  [? help · e explain]",
+        Style::new().fg(t.dim),
+    ));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ---- hero strip ------------------------------------------------------------
 
-fn draw_hero(
-    f: &mut Frame,
-    ui: &Ui,
-    t: &Theme,
-    area: Rect,
-    d: Option<&Derived>,
-    compact: bool,
-) {
+fn draw_hero(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect, d: Option<&Derived>, compact: bool) {
     let focus = ui.window_focus;
     let block = block(t, "Engine status", None);
     let inner = block.inner(area);
@@ -344,7 +365,12 @@ fn draw_hero(
             )
         };
         let f_run = Style::new().fg(t.fg).add_modifier(Modifier::BOLD);
-        cells.push(kv("RUNNING", &fmt_num(d.running), "being answered now", f_run));
+        cells.push(kv(
+            "RUNNING",
+            &fmt_num(d.running),
+            "being answered now",
+            f_run,
+        ));
         let q_style = match d.queue.unwrap_or(0.0) {
             q if q > 20.0 => Style::new().fg(t.bad).add_modifier(Modifier::BOLD),
             q if q > 5.0 => Style::new().fg(t.warn).add_modifier(Modifier::BOLD),
@@ -358,10 +384,7 @@ fn draw_hero(
                     format!("{:.0} tok/s", instant.unwrap_or(0.0)),
                     Style::new().fg(color).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("  ·  {}", triple(win)),
-                    Style::new().fg(t.dim),
-                ),
+                Span::styled(format!("  ·  {}", triple(win)), Style::new().fg(t.dim)),
             ])
         };
         cells.push((
@@ -386,7 +409,9 @@ fn draw_hero(
                 .map(|p| format!("{} {}", p.name, pool_value(p)))
                 .collect::<Vec<_>>()
                 .join(" · "),
-            Style::new().fg(usage_color(t, worst)).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(usage_color(t, worst))
+                .add_modifier(Modifier::BOLD),
         ));
         let ttft = d.ttft[focus].p95;
         cells.push(kv(
@@ -436,7 +461,11 @@ fn draw_hero(
     }
 }
 
-fn latency_color(t: &Theme, p95: Option<f64>, _q: &crate::derive::Quantiles) -> ratatui::style::Color {
+fn latency_color(
+    t: &Theme,
+    p95: Option<f64>,
+    _q: &crate::derive::Quantiles,
+) -> ratatui::style::Color {
     match p95 {
         Some(v) if v > 2.0 => t.bad,
         Some(v) if v > 0.5 => t.warn,
@@ -447,7 +476,13 @@ fn latency_color(t: &Theme, p95: Option<f64>, _q: &crate::derive::Quantiles) -> 
 
 // ---- graphs -----------------------------------------------------------------
 
-fn draw_graphs_row(f: &mut Frame, t: &Theme, area: Rect, d: &Derived, peaks: &crate::derive::Peaks) {
+fn draw_graphs_row(
+    f: &mut Frame,
+    t: &Theme,
+    area: Rect,
+    d: &Derived,
+    peaks: &crate::derive::Peaks,
+) {
     let cols = Layout::horizontal([
         Constraint::Percentage(29),
         Constraint::Percentage(29),
@@ -468,15 +503,13 @@ pub enum RateGraph {
 /// Calibration gridlines for an observed peak: every multiple of the
 /// round step up to and including the first one above the peak, with the
 /// scale topped 10% above the highest gridline.
-fn grid_for_scale(
-    scale: f64,
-    t: &Theme,
-) -> (Vec<(f64, ratatui::style::Color)>, f64) {
+fn grid_for_scale(scale: f64, t: &Theme) -> (Vec<(f64, ratatui::style::Color)>, f64) {
     if scale >= 10.0 {
         let step = 10.0_f64.powf(scale.log10().floor());
         let top_line = (scale / step).ceil() * step;
-        let lines: Vec<(f64, ratatui::style::Color)> =
-            (1..=(top_line / step) as i64).map(|m| (m as f64 * step, t.dim)).collect();
+        let lines: Vec<(f64, ratatui::style::Color)> = (1..=(top_line / step) as i64)
+            .map(|m| (m as f64 * step, t.dim))
+            .collect();
         let ymax = (top_line * 1.1).max(scale * 1.15).max(10.0);
         (lines, ymax)
     } else {
@@ -495,7 +528,7 @@ fn draw_rate_graph(
     let g = &d.graphs;
     let (vals, instant, color, title, gloss, sub, with_stalls) = match which {
         RateGraph::Prefill => (
-            &g.prefill,
+            &g.prefill.vals,
             d.prefill_instant,
             t.s2,
             "Prefill",
@@ -507,7 +540,7 @@ fn draw_rate_graph(
             false,
         ),
         RateGraph::Decode => (
-            &g.decode,
+            &g.decode.vals,
             d.decode_instant,
             t.s1,
             "Decode",
@@ -535,10 +568,17 @@ fn draw_rate_graph(
         ),
         Span::styled(format!("({gloss}) "), Style::new().fg(t.dim)),
         Span::styled(
-            format!("\u{2014} now {:.0} · peak {:.0} ", instant.unwrap_or(0.0), scale),
+            format!(
+                "\u{2014} now {:.0} · peak {:.0} ",
+                instant.unwrap_or(0.0),
+                scale
+            ),
             Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("\u{25cf} ", Style::new().fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "\u{25cf} ",
+            Style::new().fg(color).add_modifier(Modifier::BOLD),
+        ),
     ]);
     let block = block_titled(t, title, sub);
     let inner = block.inner(area);
@@ -564,8 +604,8 @@ fn draw_right_graphs(
     d: &Derived,
     peaks: &crate::derive::Peaks,
 ) {
-    let rows = Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)])
-        .split(area);
+    let rows =
+        Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)]).split(area);
 
     let g = &d.graphs;
 
@@ -579,7 +619,9 @@ fn draw_right_graphs(
         title_spans.push(Span::styled(" \u{b7} ", Style::new().fg(t.dim)));
         title_spans.push(Span::styled(
             format!("{} {}", p.name, pool_value(p)),
-            Style::new().fg(pool_colors[i % pool_colors.len()]).add_modifier(Modifier::BOLD),
+            Style::new()
+                .fg(pool_colors[i % pool_colors.len()])
+                .add_modifier(Modifier::BOLD),
         ));
     }
     title_spans.push(Span::styled(" ", Style::new().fg(t.fg)));
@@ -587,7 +629,7 @@ fn draw_right_graphs(
         t,
         Line::from(title_spans),
         Some(Line::from(Span::styled(
-            " KV/mamba full = requests wait · host full is normal (it recycles old entries — see evictions/s) ".to_string(),
+            " KV/mamba full = requests wait · host full is normal (it recycles its own old entries) ".to_string(),
             Style::new().fg(t.dim),
         ))),
     );
@@ -596,7 +638,10 @@ fn draw_right_graphs(
     // never more lanes than the area has rows (each lane needs a graph
     // row plus its axis row), or the axis lines of zero-height lanes
     // would smear onto the block border
-    let n = d.pools.len().clamp(1, (lane_area.height as usize / 2).max(1));
+    let n = d
+        .pools
+        .len()
+        .clamp(1, (lane_area.height as usize / 2).max(1));
     let lanes = Layout::vertical(vec![Constraint::Ratio(1, n as u32); n])
         .spacing(1)
         .split(lane_area);
@@ -635,7 +680,10 @@ fn draw_right_graphs(
             ),
             // exactly fill the lane width, or the graph's right-edge
             // column peeks out past the underline
-            Span::styled("\u{2500}".repeat(w.saturating_sub(p.name.chars().count() + 2)), Style::new().fg(color)),
+            Span::styled(
+                "\u{2500}".repeat(w.saturating_sub(p.name.chars().count() + 2)),
+                Style::new().fg(color),
+            ),
         ]);
         if lanes[i].height >= 1 {
             let axis_rect = Rect {
@@ -671,7 +719,10 @@ fn draw_right_graphs(
     );
     let iblock = block_titled(
         t,
-        Line::from(Span::styled(format!(" {title} "), Style::new().fg(t.fg).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            format!(" {title} "),
+            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
+        )),
         Some(Line::from(Span::styled(
             " how fast each answer is being written — dips are stalls ".to_string(),
             Style::new().fg(t.dim),
@@ -692,7 +743,6 @@ fn draw_right_graphs(
         &sgrid,
     );
 }
-
 
 #[allow(clippy::too_many_arguments)]
 fn mini_line_graph(
@@ -791,7 +841,11 @@ fn mini_line_graph(
                 } else {
                     n
                 };
-                ctx.print(2.0, ry + 2.0, Span::styled(label, Style::new().fg(label_style.unwrap_or(color))));
+                ctx.print(
+                    2.0,
+                    ry + 2.0,
+                    Span::styled(label, Style::new().fg(label_style.unwrap_or(color))),
+                );
             }
             for (cx, h) in &cols {
                 ctx.draw(&CLine {
@@ -817,14 +871,7 @@ fn mini_line_graph(
 
 // ---- latency panel -----------------------------------------------------------
 
-fn draw_latency(
-    f: &mut Frame,
-    ui: &Ui,
-    t: &Theme,
-    area: Rect,
-    d: Option<&Derived>,
-    compact: bool,
-) {
+fn draw_latency(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect, d: Option<&Derived>, compact: bool) {
     let block = block(
         t,
         "Latency — how long users wait to see words",
@@ -886,7 +933,6 @@ fn triple(v: &[Option<f64>; 3]) -> String {
         .join("/")
 }
 
-
 /// Header for the combined latency table: focused-window percentiles, then
 /// p95 across the three windows.
 fn lat_header(t: &Theme) -> Line<'static> {
@@ -898,7 +944,10 @@ fn lat_header(t: &Theme) -> Line<'static> {
         ),
         Span::styled("   │  ", Style::new().fg(t.dim)),
         Span::styled(
-            format!("{:>7} {:>7} {:>7}", "p95\u{b7}5s", "p95\u{b7}15s", "p95\u{b7}60s"),
+            format!(
+                "{:>7} {:>7} {:>7}",
+                "p95\u{b7}5s", "p95\u{b7}15s", "p95\u{b7}60s"
+            ),
             Style::new().fg(t.dim).add_modifier(Modifier::BOLD),
         ),
     ])
@@ -911,11 +960,7 @@ fn lat_row(
     lat: &crate::derive::LatencyTriple,
 ) -> Line<'static> {
     let fmt = |v: Option<f64>| fmt_secs(v);
-    let wins = [
-        fmt(lat[0].p95),
-        fmt(lat[1].p95),
-        fmt(lat[2].p95),
-    ];
+    let wins = [fmt(lat[0].p95), fmt(lat[1].p95), fmt(lat[2].p95)];
     Line::from(vec![
         Span::styled(format!(" {name:<26}"), Style::new().fg(t.fg)),
         Span::styled(
@@ -938,11 +983,7 @@ fn lat_row(
     ])
 }
 
-fn lat_row_compact(
-    t: &Theme,
-    name: &str,
-    q: &crate::derive::Quantiles,
-) -> Line<'static> {
+fn lat_row_compact(t: &Theme, name: &str, q: &crate::derive::Quantiles) -> Line<'static> {
     let fmt = |v: Option<f64>| fmt_secs(v);
     Line::from(vec![
         Span::styled(format!(" {name:<26}"), Style::new().fg(t.fg)),
@@ -961,7 +1002,6 @@ fn lat_row_compact(
     ])
 }
 
-
 // ---- detail ------------------------------------------------------------------
 
 fn queues_col_lines(d: Option<&Derived>, t: &Theme) -> Vec<Line<'static>> {
@@ -969,15 +1009,14 @@ fn queues_col_lines(d: Option<&Derived>, t: &Theme) -> Vec<Line<'static>> {
     if let Some(d) = d {
         let sq = &d.subqueues;
         let val = |i: usize| -> String {
-            sq.get(i).map(|(_, v)| fmt_num(*v)).unwrap_or_else(|| "\u{2014}".into())
+            sq.get(i)
+                .map(|(_, v)| fmt_num(*v))
+                .unwrap_or_else(|| "\u{2014}".into())
         };
         let group = |label: &str, a: &str, b: &str| {
             vec![
                 Line::from(Span::styled(format!(" {label}"), Style::new().fg(t.dim))),
-                Line::from(Span::styled(
-                    format!("  {a} · {b}"),
-                    Style::new().fg(t.fg),
-                )),
+                Line::from(Span::styled(format!("  {a} · {b}"), Style::new().fg(t.fg))),
             ]
         };
         l.extend(group(
@@ -1003,10 +1042,22 @@ fn queues_col_lines(d: Option<&Derived>, t: &Theme) -> Vec<Line<'static>> {
 fn quality_col_kvs(d: Option<&Derived>) -> Vec<Kv> {
     let mut q: Vec<Kv> = Vec::new();
     if let Some(d) = d {
-        q.push(Kv::plain("cache hit", fmt_pct(d.cache_hit), "how much of each new prompt it already remembers — high = fast starts"));
-        q.push(Kv::plain("spec accept", fmt_pct(d.spec_accept), "how often it guesses its own next words right — high = feels faster"));
+        q.push(Kv::plain(
+            "cache hit",
+            fmt_pct(d.cache_hit),
+            "how much of each new prompt it already remembers — high = fast starts",
+        ));
+        q.push(Kv::plain(
+            "spec accept",
+            fmt_pct(d.spec_accept),
+            "how often it guesses its own next words right — high = feels faster",
+        ));
         if let Some(l) = d.spec_accept_len {
-            q.push(Kv::plain("spec length", format!("{l:.2}"), "words gained per guess, on average"));
+            q.push(Kv::plain(
+                "spec length",
+                format!("{l:.2}"),
+                "words gained per guess, on average",
+            ));
         }
         q.push(Kv::plain(
             "l2 dev\u{b7}host",
@@ -1015,16 +1066,20 @@ fn quality_col_kvs(d: Option<&Derived>) -> Vec<Kv> {
         ));
         q.push(Kv::plain(
             "l2 wb\u{b7}rb",
-            format!(
-                "{} · {}",
-                fmt_num(d.l2_wb),
-                fmt_num(d.l2_rb)
-            ),
+            format!("{} · {}", fmt_num(d.l2_wb), fmt_num(d.l2_rb)),
             "tokens/s written to / read back from host tier",
         ));
-        q.push(Kv::plain("gen depth", format!("{} tok", fmt_num(d.gen_progress)), "how far into their answers the current requests are"));
+        q.push(Kv::plain(
+            "gen depth",
+            format!("{} tok", fmt_num(d.gen_progress)),
+            "how far into their answers the current requests are",
+        ));
         if let Some(r) = d.new_token_ratio {
-            q.push(Kv::plain("new-token ratio", format!("{r:.2}"), "scheduler policy knob (1.0 = default)"));
+            q.push(Kv::plain(
+                "new-token ratio",
+                format!("{r:.2}"),
+                "scheduler policy knob (1.0 = default)",
+            ));
         }
     }
     q
@@ -1036,18 +1091,52 @@ fn health_col_kvs(d: Option<&Derived>, focus: usize, t: &Theme) -> Vec<Kv> {
         let s = d.stalls[focus];
         let (sc, scol) = if s.count > 0 {
             (
-                format!("{} × {:.1}s in {}", s.count, s.seconds / s.count.max(1) as f64, WIN_LABELS[focus]),
+                format!(
+                    "{} × {:.1}s in {}",
+                    s.count,
+                    s.seconds / s.count.max(1) as f64,
+                    WIN_LABELS[focus]
+                ),
                 t.bad,
             )
         } else {
             ("0".into(), t.good)
         };
-        h.push(Kv::colored("stalls", sc, "moments when prefill work froze every stream", scol));
-        h.push(Kv::colored("evictions/s", fmt_num(d.evict_rate), "finished work thrown out early — memory pressure", trouble_color(t, d.evict_rate)));
-        h.push(Kv::colored("retractions/s", fmt_num(d.retract_rate), "requests restarted mid-answer — the worst kind", trouble_color(t, d.retract_rate)));
-        h.push(Kv::colored("503/s", fmt_num(d.http_503_rate), "requests refused outright", trouble_color(t, d.http_503_rate)));
-        h.push(Kv::colored("l2 drop/s", fmt_num(d.l2_drop), "host-tier tokens evicted before reuse", trouble_color(t, d.l2_drop)));
-        h.push(Kv::plain("http active", fmt_num(d.http_active), "connections open right now"));
+        h.push(Kv::colored(
+            "stalls",
+            sc,
+            "moments when prefill work froze every stream",
+            scol,
+        ));
+        h.push(Kv::colored(
+            "evictions/s",
+            fmt_num(d.evict_rate),
+            "device KV cache slots freed to make room",
+            trouble_color(t, d.evict_rate),
+        ));
+        h.push(Kv::colored(
+            "retractions/s",
+            fmt_num(d.retract_rate),
+            "requests restarted mid-answer — the worst kind",
+            trouble_color(t, d.retract_rate),
+        ));
+        h.push(Kv::colored(
+            "503/s",
+            fmt_num(d.http_503_rate),
+            "requests refused outright",
+            trouble_color(t, d.http_503_rate),
+        ));
+        h.push(Kv::colored(
+            "l2 drop/s",
+            fmt_num(d.l2_drop),
+            "device tokens destroyed without a host backup",
+            trouble_color(t, d.l2_drop),
+        ));
+        h.push(Kv::plain(
+            "http active",
+            fmt_num(d.http_active),
+            "connections open right now",
+        ));
         h.push(Kv::plain(
             "cpu cores/s",
             format!(
@@ -1058,17 +1147,24 @@ fn health_col_kvs(d: Option<&Derived>, focus: usize, t: &Theme) -> Vec<Kv> {
             ),
             "",
         ));
-        h.push(Kv::gloss_only("tokenizer · detokenizer · scheduler".to_string()));
+        h.push(Kv::gloss_only(
+            "tokenizer · detokenizer · scheduler".to_string(),
+        ));
     }
     h
 }
 
-fn peaks_col_lines(d: Option<&Derived>, peaks: &crate::derive::Peaks, t: &Theme) -> Vec<Line<'static>> {
+fn peaks_col_lines(
+    d: Option<&Derived>,
+    peaks: &crate::derive::Peaks,
+    t: &Theme,
+) -> Vec<Line<'static>> {
     let pk = |label: &str, v: Option<f64>| {
         Line::from(vec![
             Span::styled(format!(" {label:<9}"), Style::new().fg(t.dim)),
             Span::styled(
-                v.map(|v| format!("{v:.0} tok/s")).unwrap_or_else(|| "\u{2014}".into()),
+                v.map(|v| format!("{v:.0} tok/s"))
+                    .unwrap_or_else(|| "\u{2014}".into()),
                 Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
             ),
         ])
@@ -1081,7 +1177,8 @@ fn peaks_col_lines(d: Option<&Derived>, peaks: &crate::derive::Peaks, t: &Theme)
     l.push(Line::from(vec![
         Span::styled(" engine   ".to_string(), Style::new().fg(t.dim)),
         Span::styled(
-            d.map(|d| tok_gauge(d.gen_throughput_gauge)).unwrap_or_else(|| "\u{2014}".into()),
+            d.map(|d| tok_gauge(d.gen_throughput_gauge))
+                .unwrap_or_else(|| "\u{2014}".into()),
             Style::new().fg(t.fg),
         ),
     ]));
@@ -1133,7 +1230,11 @@ fn draw_detail(
             text.push_str(&format!(
                 "stalls {} × {:.1}s in {} · evict/s {} · retract/s {} · 503/s {} · active {}",
                 s.count,
-                if s.count > 0 { s.seconds / s.count.max(1) as f64 } else { 0.0 },
+                if s.count > 0 {
+                    s.seconds / s.count.max(1) as f64
+                } else {
+                    0.0
+                },
                 WIN_LABELS[focus],
                 fmt_num(d.evict_rate),
                 fmt_num(d.retract_rate),
@@ -1167,16 +1268,30 @@ fn draw_detail(
     f.render_widget(Paragraph::new(l1), inner1);
     f.render_widget(b1, cols[0]);
 
-    let b2 = block(t, "Answer quality", Some("what makes the model feel fast or smart"));
+    let b2 = block(
+        t,
+        "Answer quality",
+        Some("what makes the model feel fast or smart"),
+    );
     let q = quality_col_kvs(d);
     let inner2 = b2.inner(cols[1]);
-    f.render_widget(Paragraph::new(kv_lines(t, q, inner2.width as usize)), inner2);
+    f.render_widget(
+        Paragraph::new(kv_lines(t, q, inner2.width as usize)),
+        inner2,
+    );
     f.render_widget(b2, cols[1]);
 
-    let b3 = block(t, "Health & trouble", Some("anything here that is not zero deserves a look"));
+    let b3 = block(
+        t,
+        "Health & trouble",
+        Some("anything here that is not zero deserves a look"),
+    );
     let h = health_col_kvs(d, focus, t);
     let inner3 = b3.inner(cols[2]);
-    f.render_widget(Paragraph::new(kv_lines(t, h, inner3.width as usize)), inner3);
+    f.render_widget(
+        Paragraph::new(kv_lines(t, h, inner3.width as usize)),
+        inner3,
+    );
     f.render_widget(b3, cols[2]);
 
     let b4 = block(t, "Peaks", Some("since sgtop started"));
@@ -1205,7 +1320,11 @@ fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
             remaining -= len;
             spans.push(span);
         } else {
-            let cut: String = span.content.chars().take(remaining.saturating_sub(1)).collect();
+            let cut: String = span
+                .content
+                .chars()
+                .take(remaining.saturating_sub(1))
+                .collect();
             spans.push(Span::styled(format!("{cut}\u{2026}"), span.style));
             remaining = 0;
         }
@@ -1223,14 +1342,29 @@ struct Kv {
 
 impl Kv {
     fn plain(k: &str, v: String, gloss: &str) -> Self {
-        Self { k: k.into(), v, gloss: gloss.into(), style: None }
+        Self {
+            k: k.into(),
+            v,
+            gloss: gloss.into(),
+            style: None,
+        }
     }
     fn colored(k: &str, v: String, gloss: &str, style: ratatui::style::Color) -> Self {
-        Self { k: k.into(), v, gloss: gloss.into(), style: Some(Style::new().fg(style)) }
+        Self {
+            k: k.into(),
+            v,
+            gloss: gloss.into(),
+            style: Some(Style::new().fg(style)),
+        }
     }
     /// A dim full-width line (used for the CPU column legend).
     fn gloss_only(gloss: String) -> Self {
-        Self { k: String::new(), v: String::new(), gloss, style: None }
+        Self {
+            k: String::new(),
+            v: String::new(),
+            gloss,
+            style: None,
+        }
     }
 }
 
@@ -1253,11 +1387,17 @@ fn kv_lines(t: &Theme, entries: Vec<Kv>, width: usize) -> Vec<Line<'static>> {
         .map(|e| {
             if e.k.is_empty() && e.v.is_empty() {
                 return truncate_line(
-                    Line::from(Span::styled(format!(" {}", e.gloss), Style::new().fg(t.dim))),
+                    Line::from(Span::styled(
+                        format!(" {}", e.gloss),
+                        Style::new().fg(t.dim),
+                    )),
                     width,
                 );
             }
-            let value_style = e.style.unwrap_or(Style::new().fg(t.fg)).add_modifier(Modifier::BOLD);
+            let value_style = e
+                .style
+                .unwrap_or(Style::new().fg(t.fg))
+                .add_modifier(Modifier::BOLD);
             truncate_line(
                 Line::from(vec![
                     Span::styled(format!(" {:<kpad$}  ", e.k), Style::new().fg(t.fg)),
@@ -1278,8 +1418,6 @@ fn trouble_color(t: &Theme, v: Option<f64>) -> ratatui::style::Color {
     }
 }
 
-
-
 // ---- help & explain overlays ---------------------------------------------
 
 fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
@@ -1287,14 +1425,19 @@ fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
     let h = 16.min(area.height);
     let x = area.x + (area.width - w) / 2;
     let y = area.y + (area.height - h) / 2;
-    let area = Rect { x, y, width: w, height: h };
+    let area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     let rows = [
         ("q / Esc", "quit"),
         ("space", "pause scraping (for staring & screenshots)"),
         ("c", "toggle compact / full layout"),
         ("g", "toggle graphs"),
-        ("1 2 3", "graphs follow the 5s / 15s / 60s window"),
+        ("1 2 3", "focus the 5s / 15s / 60s window"),
         ("t", "cycle theme"),
         ("e", "plain-language tour of every panel"),
         ("+ / -", "poll interval (faster / slower)"),
@@ -1304,7 +1447,10 @@ fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     for (k, v) in rows {
         lines.push(Line::from(vec![
-            Span::styled(format!(" {:<9}", k), Style::new().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {:<9}", k),
+                Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(v.to_string(), Style::new().fg(t.fg)),
         ]));
     }
@@ -1313,7 +1459,10 @@ fn draw_help(f: &mut Frame, t: &Theme, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::new().fg(t.accent))
         .style(Style::new().bg(t.bg))
-        .title(Span::styled(" keymap ", Style::new().fg(t.fg).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            " keymap ",
+            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
+        ));
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -1340,7 +1489,10 @@ fn draw_explain(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect) {
         )));
         for para in body.split("\n\n") {
             for seg in wrap_text(para, (inner.width as usize).saturating_sub(4).max(20)) {
-                lines.push(Line::from(Span::styled(format!(" {seg}"), Style::new().fg(t.fg))));
+                lines.push(Line::from(Span::styled(
+                    format!(" {seg}"),
+                    Style::new().fg(t.fg),
+                )));
             }
             lines.push(Line::default());
         }
@@ -1352,11 +1504,11 @@ fn draw_explain(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect) {
     section("p50 / p95 / p99", "p50 is a typical request. p95 is the experience of the unluckiest 1-in-20. p99 is the worst moments. If p50 is fine but p95 is bad, most people are happy but some are having a bad time — that gap is the number to watch.\n\nThe 5s/15s/60s columns are a fresh p95 of just that window's requests — nothing is averaged with the past, so a single slow request shows up in the 5s column immediately. Bigger windows move slower only because they cover more requests.", &mut lines);
     section("Waiting line (queue)", "Requests that arrived but have not started. A short, spiky line is normal. A tall, flat line means the server is overloaded and everyone's wait grows.", &mut lines);
     section("Peaks", "The Peak box holds the highest rates seen since sgtop started: the busiest decode moment, the biggest prefill burst, and single — the fastest one stream has ever moved (total decode speed divided by how many requests were sharing it).", &mut lines);
-    section("Memory pools", "The model keeps working memory for every conversation in progress (KV), and optionally for alternative memory types (mamba, SWA). At 100% a pool is full: new requests wait, and the server may throw out or restart old ones (see evictions and retractions).\n\nThe host tier is the exception: it is a large CPU-RAM cache of prompt prefixes that stays pinned near 100% in normal operation and recycles the oldest entries when it needs room (that is the evictions/s counter). A full host tier is not a problem — only KV or mamba running full is.", &mut lines);
+    section("Memory pools", "The model keeps working memory for every conversation in progress (KV), and optionally for alternative memory types (mamba, SWA). At 100% a pool is full: new requests wait, and the server may throw out or restart old ones (see evictions and retractions).\n\nThe host tier is the exception: it is a large CPU-RAM cache of prompt prefixes that stays pinned near 100% in normal operation and recycles the oldest entries when it needs room. A full host tier is not a problem — only KV or mamba running full is. The evictions/s counter belongs to the device KV cache, not the host tier.", &mut lines);
     section("Stalls", "A stall is a moment when every stream froze because a prompt was being read. Measured as how many times it happened and how many seconds in total over the window.", &mut lines);
-    section("Cache hit & the L2 tiers", "How much of each new prompt the server already remembers from earlier turns. High cache hit = fast starts and less work. A sudden drop usually means a restart or very different traffic.\n\nLarge servers often keep a second, bigger cache tier in host RAM (the \"host\" pool). The l2 dev\u{b7}host line shows how much of the recent prefill work was served from the GPU-resident tier vs the host tier; wb\u{b7}rb is how many tokens per second are being written down to, or read back from, that tier. l2 drop/s counts tokens the host tier threw away before they could be reused \u{2014} it should be zero.", &mut lines);
+    section("Cache hit & the L2 tiers", "How much of each new prompt the server already remembers from earlier turns. High cache hit = fast starts and less work. A sudden drop usually means a restart or very different traffic.\n\nLarge servers often keep a second, bigger cache tier in host RAM (the \"host\" pool). The l2 dev\u{b7}host line shows how much of the recent prefill work was served from the GPU-resident tier vs the host tier; wb\u{b7}rb is how many tokens per second are being written down to, or read back from, that tier. l2 drop/s counts device tokens destroyed without a host backup \u{2014} work the host tier failed to save; it should be zero.", &mut lines);
     section("Speculative accept", "The model tries to guess several words ahead and checks them in one go. Accept rate is how often the guesses are right; accept length is how many words each lucky guess saves. High numbers make everything feel faster.", &mut lines);
-    section("Retractions & evictions", "A retraction means a running request was abandoned and restarted — its user watched their answer reset. Evictions throw cached work away early. Both should sit at zero; anything else is memory pressure.", &mut lines);
+    section("Retractions & evictions", "A retraction means a running request was abandoned and restarted — its user watched their answer reset. Evictions free device KV cache slots to make room; the freed prefixes may already be backed up to the host tier, so steady recycling is normal while a spike means memory pressure. l2 drop/s is the harmful one: device tokens destroyed without a host backup, work truly lost.", &mut lines);
 
     f.render_widget(Paragraph::new(lines).scroll((ui.scroll, 0)), inner);
 }
@@ -1428,7 +1580,8 @@ fn fmt_num(v: Option<f64>) -> String {
 }
 
 fn fmt_pct(v: Option<f64>) -> String {
-    v.map(|v| format!("{:.0}%", v * 100.0)).unwrap_or_else(|| "—".into())
+    v.map(|v| format!("{:.0}%", v * 100.0))
+        .unwrap_or_else(|| "—".into())
 }
 
 /// 115904 -> "116k", 2843392 -> "2.8M"
@@ -1469,5 +1622,3 @@ fn fmt_secs(v: Option<f64>) -> String {
 fn tok_gauge(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into())
 }
-
-

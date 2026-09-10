@@ -1,5 +1,14 @@
 use clap::Parser;
 
+fn finite_interval(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("invalid number: {s}"))?;
+    if v.is_finite() {
+        Ok(v)
+    } else {
+        Err(format!("interval must be finite, got {s}"))
+    }
+}
+
 /// btop-style live TUI for a sglang inference server.
 ///
 /// Scrapes the sglang /metrics endpoint once per interval and renders a
@@ -21,7 +30,7 @@ pub struct Args {
     pub insecure: bool,
 
     /// Scrape interval in seconds (clamped 0.5–10; adjustable live with +/-).
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 1.0, value_parser = finite_interval)]
     pub interval: f64,
 
     /// Theme: gruvbox | catppuccin | tokyonight.
