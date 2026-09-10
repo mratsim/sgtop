@@ -21,7 +21,7 @@ fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_secs_f64(wait));
             }
             let body = scrape::fetch_once(&url, args.api_key.as_deref(), args.insecure)?;
-            h.push(Instant::now(), metrics::parse(&body));
+            h.push(Instant::now(), metrics::parse(&body)?);
         }
         let mut peaks = sgtop::derive::Peaks::default();
         sgtop::once::print_once(&h, &mut peaks)?;

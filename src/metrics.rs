@@ -15,6 +15,24 @@ impl SeriesKey {
     }
 }
 
+/// Renders the key in Prometheus exposition form, without escaping
+/// label values (error messages only): the family name,
+/// followed by `{k="v",...}` when labels are present
+/// (e.g. `m:h{mode="decode"}`), so label-distinct families are
+/// distinguishable.
+impl std::fmt::Display for SeriesKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.name)?;
+        for (i, (k, v)) in self.labels.iter().enumerate() {
+            write!(f, "{}{k}=\"{v}\"", if i == 0 { "{" } else { "," })?;
+        }
+        if !self.labels.is_empty() {
+            write!(f, "}}")?;
+        }
+        Ok(())
+    }
+}
+
 /// Cumulative histogram state at one scrape, for one label combination.
 #[derive(Debug, Clone, Default)]
 pub struct HistSeries {
@@ -47,12 +65,42 @@ struct HistBuilder {
     count: u64,
 }
 
+/// Maximum number of series (simple + histogram families combined) accepted
+/// in one scrape.
+///
+/// 16384 sits above the ~12k series measured on a real busy multi-rank
+/// deployment, with headroom. [`BUCKET_CAP`] bounds one family's ladder
+/// length. The two caps are independent, so together they do not bound
+/// the aggregate: per-sample heap is limited by the 64 MiB scrape body cap, and
+/// a hostile exporter spread across many families can pin single-digit GB
+/// through the ring (~64 MiB x 150 ≈ 9.6 GB ceiling). Removing that ceiling
+/// requires ingest-time aggregation, out of scope here (deferred).
+pub const SERIES_CAP: usize = 16_384;
+
+/// Maximum number of buckets accepted in a single histogram family per
+/// scrape.
+///
+/// A real exporter's ladder stays under 100 buckets, so anything beyond 256
+/// is a hostile payload funneling unbounded `_bucket` lines into one family,
+/// which the series cap treats as a single series. Exceeding it rejects
+/// the whole sample, like [`SERIES_CAP`]. The cap check runs for every
+/// family record line, so a family already at the cap is rejected
+/// when its trailing `_sum`/`_count` lines arrive (the bail then reports
+/// `BUCKET_CAP + 1` even though no further bucket was inserted).
+pub const BUCKET_CAP: usize = 256;
+
 /// Parse a Prometheus text exposition payload into a [`Sample`].
 ///
 /// Handles `# HELP`/`# TYPE` headers, `name{labels} value` records, label
 /// escape sequences (`\\`, `\"`, `\n`), optional timestamps, and histogram
-/// bucket ladders (`_bucket` with `le`, `_sum`, `_count`).
-pub fn parse(body: &str) -> Sample {
+/// bucket ladders (`_bucket` with `le`, `_sum`, `_count`). Malformed records
+/// are skipped line by line.
+///
+/// Errors when the payload exceeds [`SERIES_CAP`] series or any histogram
+/// family reaches [`BUCKET_CAP`] buckets and another family record line
+/// follows: the whole sample is rejected, never truncated, so callers can
+/// surface it like any failed scrape.
+pub fn parse(body: &str) -> anyhow::Result<Sample> {
     let mut types: BTreeMap<String, String> = BTreeMap::new();
     let mut simple = BTreeMap::new();
     let mut hists: BTreeMap<SeriesKey, HistBuilder> = BTreeMap::new();
@@ -73,15 +121,12 @@ pub fn parse(body: &str) -> Sample {
         }
 
         let (name, label_src, value_src) = match line.find('{') {
-            Some(open) => match line[open..].find('}') {
-                Some(close_rel) => {
-                    let close = open + close_rel;
-                    (
-                        &line[..open],
-                        Some(&line[open + 1..close]),
-                        line[close + 1..].trim(),
-                    )
-                }
+            Some(open) => match label_block_end(line, open) {
+                Some(close) => (
+                    &line[..open],
+                    Some(&line[open + 1..close]),
+                    line[close + 1..].trim(),
+                ),
                 None => continue,
             },
             None => match line.split_once(char::is_whitespace) {
@@ -119,6 +164,19 @@ pub fn parse(body: &str) -> Sample {
                 name: base.to_string(),
                 labels: labels.into_iter().filter(|(k, _)| k != "le").collect(),
             };
+            // the cap check runs on every family record line, not just `_bucket`:
+            // a trailing `_sum`/`_count` line rejects a family already at the cap
+            // (whole-sample rejection, same as above)
+            if hists
+                .get(&key)
+                .is_some_and(|b| b.buckets.len() >= BUCKET_CAP)
+            {
+                anyhow::bail!(
+                    "endpoint too large: {} has {} buckets (cap {BUCKET_CAP})",
+                    key,
+                    BUCKET_CAP + 1
+                );
+            }
             let b = hists.entry(key).or_default();
             match part {
                 // a bucket without a usable `le` bound can't participate in
@@ -139,6 +197,11 @@ pub fn parse(body: &str) -> Sample {
             };
             simple.insert(key, value);
         }
+
+        let series = simple.len() + hists.len();
+        if series > SERIES_CAP {
+            anyhow::bail!("endpoint too large: {series} series (cap {SERIES_CAP})");
+        }
     }
 
     let hist = hists
@@ -158,7 +221,28 @@ pub fn parse(body: &str) -> Sample {
         })
         .collect();
 
-    Sample { simple, hist }
+    Ok(Sample { simple, hist })
+}
+
+/// Returns the byte offset of the `}` that closes the label block whose
+/// `{` sits at `open`. Braces and backslash-escaped characters (`\"`,
+/// `\\`) inside quoted label values do not close the block. A block whose
+/// quote never closes has no end: the record is dropped by the caller.
+fn label_block_end(line: &str, open: usize) -> Option<usize> {
+    let mut in_quotes = false;
+    let mut chars = line[open + 1..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '}' if !in_quotes => return Some(open + 1 + i),
+            // consume the escaped character so it cannot toggle quote state
+            '\\' if in_quotes => {
+                chars.next();
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_value(s: &str) -> Option<f64> {

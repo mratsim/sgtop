@@ -2,7 +2,7 @@ use std::time::{Duration, Instant};
 
 use sgtop::derive::{derive, WINDOWS};
 use sgtop::history::{quantile_from_buckets, History};
-use sgtop::metrics::{parse, Sample, SeriesKey};
+use sgtop::metrics::{parse, Sample, SeriesKey, BUCKET_CAP, SERIES_CAP};
 
 fn fixture() -> String {
     std::fs::read_to_string(concat!(
@@ -24,7 +24,7 @@ fn key(name: &str, labels: &[(&str, &str)]) -> SeriesKey {
 
 #[test]
 fn parses_live_fixture() {
-    let s = parse(&fixture());
+    let s = parse(&fixture()).unwrap();
     let running = key(
         "sglang:num_running_reqs",
         &[
@@ -79,13 +79,162 @@ fn parses_live_fixture() {
 fn parses_labels_with_escapes_and_timestamps() {
     let s = parse(
         "# TYPE m:gauge gauge\nm:gauge 3.5\nm:gauge{a=\"x\",b=\"say \\\"hi\\\"\"} 4.5 1234567890\n",
-    );
+    )
+    .unwrap();
     assert_eq!(s.gauge("m:gauge"), Some(3.5)); // label-less series
     let k = SeriesKey {
         name: "m:gauge".into(),
         labels: vec![("a".into(), "x".into()), ("b".into(), "say \"hi\"".into())],
     };
     assert_eq!(s.simple.get(&k), Some(&4.5));
+}
+
+#[test]
+fn label_values_with_braces_and_escapes_parse_fully() {
+    // raw payload lines: `\\` in Rust source is one backslash in the payload
+    let body = "# TYPE m gauge\n\
+        m{v=\"a{b}\"} 1\n\
+        m{v=\"a\\\"{b}\\\"\"} 2\n\
+        m{v=\"a\\\\\"} 3\n";
+    let s = parse(body).unwrap();
+    assert_eq!(s.simple.get(&key("m", &[("v", "a{b}")])), Some(&1.0));
+    // escaped quotes survive unescaping: payload value is a"{b}"
+    assert_eq!(s.simple.get(&key("m", &[("v", "a\"{b}\"")])), Some(&2.0));
+    // escaped backslash: payload value is a\
+    assert_eq!(s.simple.get(&key("m", &[("v", "a\\")])), Some(&3.0));
+}
+
+// A record whose label quote never closes is dropped like any other
+// malformed line: there is no reliable label block to recover, and
+// scanning for one must neither panic nor hang.
+#[test]
+fn record_with_unclosed_quote_is_dropped() {
+    let body = "# TYPE m gauge\nm{v=\"open 4\nm{ok=\"x\"} 5\n";
+    let s = parse(body).unwrap();
+    assert_eq!(s.simple.len(), 1);
+    assert_eq!(s.simple.get(&key("m", &[("ok", "x")])), Some(&5.0));
+}
+
+#[test]
+fn series_cap_admits_payloads_under_the_limit() {
+    // 5000 series: well under the cap, exercises the same counting path
+    let mut body = String::from("# TYPE m:g gauge\n");
+    for i in 0..5000 {
+        body.push_str(&format!("m:g{{id=\"{i}\"}} 1\n"));
+    }
+    let s = parse(&body).unwrap();
+    assert_eq!(s.simple.len(), 5000);
+}
+
+// One series past the cap rejects the entire payload: the error names
+// the cap and the observed count, and no partial sample is returned.
+#[test]
+fn series_cap_rejects_oversized_payload_whole() {
+    let mut body = String::from("# TYPE m:g gauge\n");
+    for i in 0..=SERIES_CAP {
+        body.push_str(&format!("m:g{{id=\"{i}\"}} 1\n"));
+    }
+    let err = parse(&body).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!(
+            "endpoint too large: {} series (cap {SERIES_CAP})",
+            SERIES_CAP + 1
+        )),
+        "error message was: {err}"
+    );
+}
+
+// Histogram families count as one series regardless of bucket-ladder length:
+// SERIES_CAP - 1 gauges plus one 5-record histogram family
+// sits exactly at the cap and must be accepted.
+#[test]
+fn series_cap_counts_histogram_families_not_bucket_lines() {
+    let mut body = String::from("# TYPE m:g gauge\n# TYPE m:h histogram\n");
+    for i in 0..SERIES_CAP - 1 {
+        body.push_str(&format!("m:g{{id=\"{i}\"}} 1\n"));
+    }
+    body.push_str(
+        "m:h_bucket{le=\"0.1\"} 1\n\
+         m:h_bucket{le=\"1\"} 2\n\
+         m:h_bucket{le=\"+Inf\"} 2\n\
+         m:h_count 2\n\
+         m:h_sum 1.0\n",
+    );
+    let s = parse(&body).unwrap();
+    assert_eq!(s.simple.len() + s.hist.len(), SERIES_CAP);
+}
+
+// One histogram family past the bucket cap rejects the entire payload,
+// like the series cap: the error names the cap and the observed count, and
+// no partial sample is returned.
+#[test]
+fn bucket_cap_rejects_family_over_the_limit() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..=BUCKET_CAP {
+        body.push_str(&format!("m:h_bucket{{le=\"{}\"}} 1\n", i as f64 * 0.001));
+    }
+    let err = parse(&body).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!(
+            "endpoint too large: m:h has {} buckets (cap {BUCKET_CAP})",
+            BUCKET_CAP + 1
+        )),
+        "error message was: {err}"
+    );
+}
+
+// The bucket-cap bail renders the full SeriesKey through Display.
+// This payload carries a non-`le` label so the labeled branch
+// (brace open, separators, closing brace) is exercised,
+// not just the bare family name.
+#[test]
+fn bucket_cap_error_names_the_full_labeled_family() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..=BUCKET_CAP {
+        body.push_str(&format!(
+            "m:h_bucket{{mode=\"decode\",le=\"{}\"}} 1\n",
+            i as f64 * 0.001
+        ));
+    }
+    let err = parse(&body).unwrap_err().to_string();
+    assert!(
+        err.contains(&format!(
+            "endpoint too large: m:h{{mode=\"decode\"}} has {} buckets (cap {BUCKET_CAP})",
+            BUCKET_CAP + 1
+        )),
+        "error message was: {err}"
+    );
+}
+
+#[test]
+// ladder-only shape is what is admitted at exactly the cap: a real
+// exporter's mandatory `_sum`/`_count` completion lines
+// after a 256-bucket ladder would reject (see the cap check's comment)
+fn bucket_cap_admits_family_at_the_limit() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..BUCKET_CAP {
+        body.push_str(&format!("m:h_bucket{{le=\"{}\"}} 1\n", i as f64 * 0.001));
+    }
+    let s = parse(&body).unwrap();
+    assert_eq!(s.hist[&key("m:h", &[])].le.len(), BUCKET_CAP);
+}
+
+#[test]
+// the cap check runs on every histogram-family record, not just _bucket:
+// a family already at 256 buckets rejects even if the next line is _sum,
+// not a 257th bucket. The assertion pins the family name and the cap,
+// not the reported bucket count.
+fn bucket_cap_fires_on_trailing_sum_after_buckets_at_the_limit() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..BUCKET_CAP {
+        body.push_str(&format!("m:h_bucket{{le=\"{}\"}} 1\n", i as f64 * 0.001));
+    }
+    body.push_str("m:h_sum 1.0\nm:h_count 2\n");
+    let err = parse(&body).unwrap_err().to_string();
+    assert!(
+        err.contains("endpoint too large: m:h") && err.contains("(cap 256)"),
+        "error message was: {err}"
+    );
 }
 
 #[test]
@@ -101,7 +250,7 @@ fn quantile_linear_interpolation() {
 }
 
 fn one_gauge(name: &str, v: f64) -> Sample {
-    parse(&format!("# TYPE {name} gauge\n{name} {v}\n"))
+    parse(&format!("# TYPE {name} gauge\n{name} {v}\n")).unwrap()
 }
 
 #[test]
@@ -131,9 +280,10 @@ fn window_quantile_falls_back_when_sparse() {
     let body = "# TYPE m:lat histogram\n\
         m:lat_bucket{le=\"0.1\"} 10\nm:lat_bucket{le=\"1\"} 19\nm:lat_bucket{le=\"+Inf\"} 20\n\
         m:lat_count 20\nm:lat_sum 5.0\n";
-    h.push(t0, parse(body));
-    h.push(t0 + Duration::from_secs(1), parse(body)); // identical -> zero new observations
-                                                      // sparse (<5 observations in window) -> snapshot fallback must kick in
+    h.push(t0, parse(body).unwrap());
+    // identical -> zero new observations
+    h.push(t0 + Duration::from_secs(1), parse(body).unwrap());
+    // sparse (<5 observations in window) -> snapshot fallback must kick in
     let q = h.hist_quantile(|k| k.name == "m:lat", 0.5, Duration::from_secs(60));
     let snapshot = h.hist_snapshot_quantile(&|k: &SeriesKey| k.name == "m:lat", 0.5);
     assert_eq!(q, snapshot);
@@ -149,6 +299,7 @@ fn mix(decode: f64, prefill: f64) -> Sample {
          # TYPE sglang:num_running_reqs gauge\n\
          sglang:num_running_reqs 4\n"
     ))
+    .unwrap()
 }
 
 #[test]
@@ -224,7 +375,7 @@ m:lat_bucket{mode=\"decode\"} 1
 m:lat_bucket{mode=\"decode\",le=\"10\"} 2
 m:other_gauge 7
 ";
-    let sample = parse(body);
+    let sample = parse(body).unwrap();
     let key = key("m:lat", &[("mode", "decode")]);
     let h = sample.hist.get(&key).expect("histogram family present");
     // only the bucket with a usable `le` survives

@@ -128,23 +128,31 @@ pub fn spawn_scraper(shared: Arc<Shared>, url: String, api_key: Option<String>, 
     std::thread::spawn(move || loop {
         if !shared.paused.load(Ordering::Relaxed) {
             match fetch(&agent, &url, api_key.as_deref()) {
-                Ok(body) => {
-                    let sample = metrics::parse(&body);
-                    if let Ok(mut h) = shared.history.lock() {
-                        h.push(Instant::now(), sample);
-                    }
-                    if let Ok(mut p) = shared.peaks.lock() {
-                        if let Ok(h) = shared.history.lock() {
-                            crate::derive::update_peaks(&mut p, &h);
+                Ok(body) => match metrics::parse(&body) {
+                    // a rejected payload (e.g. series cap) leaves history and peaks
+                    // untouched so the UI goes stale under the error banner
+                    Ok(sample) => {
+                        if let Ok(mut h) = shared.history.lock() {
+                            h.push(Instant::now(), sample);
+                        }
+                        if let Ok(mut p) = shared.peaks.lock() {
+                            if let Ok(h) = shared.history.lock() {
+                                crate::derive::update_peaks(&mut p, &h);
+                            }
+                        }
+                        if let Ok(mut t) = shared.last_ok.lock() {
+                            *t = Some(Instant::now());
+                        }
+                        if let Ok(mut e) = shared.last_error.lock() {
+                            *e = None;
                         }
                     }
-                    if let Ok(mut t) = shared.last_ok.lock() {
-                        *t = Some(Instant::now());
+                    Err(e) => {
+                        if let Ok(mut slot) = shared.last_error.lock() {
+                            *slot = Some(format!("{e:#}"));
+                        }
                     }
-                    if let Ok(mut e) = shared.last_error.lock() {
-                        *e = None;
-                    }
-                }
+                },
                 Err(e) => {
                     if let Ok(mut slot) = shared.last_error.lock() {
                         *slot = Some(format!("{e:#}"));

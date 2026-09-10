@@ -30,8 +30,8 @@ fn shared_with_fixture() -> Arc<Shared> {
     };
     let mut h = shared.history.lock().unwrap();
     // two samples so rates/graphs have a base
-    h.push(Instant::now(), parse(&body));
-    h.push(Instant::now(), parse(&body));
+    h.push(Instant::now(), parse(&body).unwrap());
+    h.push(Instant::now(), parse(&body).unwrap());
     drop(h);
     Arc::new(shared)
 }
