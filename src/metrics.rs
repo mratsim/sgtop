@@ -84,11 +84,10 @@ pub const SERIES_CAP: usize = 16_384;
 ///
 /// A real exporter's ladder stays under 100 buckets, so anything beyond 256
 /// is a hostile payload funneling unbounded `_bucket` lines into one family,
-/// which the series cap treats as a single series. Exceeding it rejects
-/// the whole sample, like [`SERIES_CAP`]. The cap check runs for every
-/// family record line, so a family already at the cap is rejected
-/// when its trailing `_sum`/`_count` lines arrive (the bail then reports
-/// `BUCKET_CAP + 1` even though no further bucket was inserted).
+/// which the series cap treats as a single series. A 257th `_bucket` record
+/// rejects the whole sample, like [`SERIES_CAP`]. The cap counts `_bucket`
+/// records only: the mandatory trailing `_sum`/`_count` lines are not buckets,
+/// so a family at exactly the cap parses.
 pub const BUCKET_CAP: usize = 256;
 
 /// Parse a Prometheus text exposition payload into a [`Sample`].
@@ -99,9 +98,8 @@ pub const BUCKET_CAP: usize = 256;
 /// are skipped line by line.
 ///
 /// Errors when the payload exceeds [`SERIES_CAP`] series or any histogram
-/// family reaches [`BUCKET_CAP`] buckets and another family record line
-/// follows: the whole sample is rejected, never truncated, so callers can
-/// surface it like any failed scrape.
+/// family exceeds [`BUCKET_CAP`] `_bucket` records. The whole sample
+/// is rejected, never truncated; callers surface it like a failed scrape.
 pub fn parse(body: &str) -> anyhow::Result<Sample> {
     let mut types: BTreeMap<String, String> = BTreeMap::new();
     let mut simple = BTreeMap::new();
@@ -175,12 +173,14 @@ pub fn parse(body: &str) -> anyhow::Result<Sample> {
                 name: base.to_string(),
                 labels: labels.into_iter().filter(|(k, _)| k != "le").collect(),
             };
-            // the cap check runs on every family record line, not just `_bucket`:
-            // a trailing `_sum`/`_count` line rejects a family already at the cap
-            // (whole-sample rejection, same as above)
-            if hists
-                .get(&key)
-                .is_some_and(|b| b.buckets.len() >= BUCKET_CAP)
+            // The cap guards `_bucket` records only: the trailing
+            // `_sum`/`_count` lines are not buckets, so a family sitting
+            // at exactly the cap completes instead of being rejected
+            // (whole-sample rejection, same as the series cap)
+            if part == 0
+                && hists
+                    .get(&key)
+                    .is_some_and(|b| b.buckets.len() >= BUCKET_CAP)
             {
                 anyhow::bail!(
                     "endpoint too large: {} has {} buckets (cap {BUCKET_CAP})",

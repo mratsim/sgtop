@@ -239,9 +239,7 @@ fn bucket_cap_error_names_the_full_labeled_family() {
 }
 
 #[test]
-// ladder-only shape is what is admitted at exactly the cap: a real
-// exporter's mandatory `_sum`/`_count` completion lines
-// after a 256-bucket ladder would reject (see the cap check's comment)
+// a ladder of exactly BUCKET_CAP buckets is admitted
 fn bucket_cap_admits_family_at_the_limit() {
     let mut body = String::from("# TYPE m:h histogram\n");
     for i in 0..BUCKET_CAP {
@@ -252,21 +250,58 @@ fn bucket_cap_admits_family_at_the_limit() {
 }
 
 #[test]
-// the cap check runs on every histogram-family record, not just _bucket:
-// a family already at 256 buckets rejects even if the next line is _sum,
-// not a 257th bucket. The assertion pins the family name and the cap,
-// not the reported bucket count.
-fn bucket_cap_fires_on_trailing_sum_after_buckets_at_the_limit() {
+// the cap counts _bucket records only: a family at exactly the cap takes
+// its mandatory trailing _sum/_count lines and parses, while a 257th
+// _bucket record still rejects the whole sample.
+fn bucket_cap_admits_trailing_sum_and_count_at_the_limit_but_not_a_257th_bucket() {
     let mut body = String::from("# TYPE m:h histogram\n");
     for i in 0..BUCKET_CAP {
         body.push_str(&format!("m:h_bucket{{le=\"{}\"}} 1\n", i as f64 * 0.001));
     }
     body.push_str("m:h_sum 1.0\nm:h_count 2\n");
+    let s = parse(&body).unwrap();
+    assert_eq!(s.hist[&key("m:h", &[])].le.len(), BUCKET_CAP);
+    assert_eq!(s.hist[&key("m:h", &[])].count, 2);
+
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..=BUCKET_CAP {
+        body.push_str(&format!("m:h_bucket{{le=\"{}\"}} 1\n", i as f64 * 0.001));
+    }
     let err = parse(&body).unwrap_err().to_string();
     assert!(
-        err.contains("endpoint too large: m:h") && err.contains("(cap 256)"),
+        err.contains(&format!(
+            "endpoint too large: m:h has {} buckets (cap {BUCKET_CAP})",
+            BUCKET_CAP + 1
+        )),
         "error message was: {err}"
     );
+}
+
+// A hostile label value that trips the bucket cap reaches the error
+// banner only after sanitization. The hostile value carries terminal
+// escape sequences, the delete byte, carriage returns, and an unescaped newline:
+// the stored message renders every control as visible notation, keeps
+// raw control bytes out, and stays debuggable (family, labels, cap intact).
+#[test]
+fn hostile_label_in_cap_error_is_banner_safe_after_sanitization() {
+    let mut body = String::from("# TYPE m:h histogram\n");
+    for i in 0..=BUCKET_CAP {
+        body.push_str(&format!(
+            "m:h_bucket{{mode=\"\u{1b}[2J\u{7f}\r\\nx\",le=\"{}\"}} 1\n",
+            i as f64 * 0.001
+        ));
+    }
+    let err = parse(&body).unwrap_err().to_string();
+    // the raw bail does carry the injected controls
+    assert!(err.chars().any(|c| c == '\u{1b}'), "message was: {err:?}");
+    let safe = sgtop::scrape::sanitize_for_terminal(&err);
+    assert!(!safe.chars().any(char::is_control), "message was: {safe:?}");
+    for notation in ["\\x1b", "\\x7f", "\\r", "\\n"] {
+        assert!(safe.contains(notation), "missing {notation}: {safe:?}");
+    }
+    // still debuggable: family, label name, and cap survive
+    assert!(safe.contains("m:h{mode="));
+    assert!(safe.contains("(cap 256)"));
 }
 
 #[test]
@@ -907,6 +942,36 @@ fn stall_ticks_equal_intervals_whose_predecessor_is_absent() {
     assert!((decode_rate - 50.0).abs() < 1e-9, "rate was {decode_rate}");
 }
 
+// A first appearance is not a stall: the decode series materializing
+// mid-window (cold start) has never collapsed, so no interval flags,
+// even while requests run and prefill computes throughout. Its leading
+// interval pairs nothing (rate 0 is absence), and no threshold arm
+// reads that absence as a measured collapse either.
+#[test]
+fn first_decode_appearance_is_not_a_stall() {
+    // prefill advances every interval, so the prefill-computing
+    // condition holds wherever the running count is positive
+    let h = stall_history(&[
+        stall_sample(None, 0.0, 4.0, None),
+        stall_sample(None, 50.0, 4.0, None),
+        stall_sample(Some(0.0), 100.0, 4.0, None),
+        stall_sample(Some(100.0), 150.0, 4.0, None),
+        stall_sample(Some(200.0), 200.0, 4.0, None),
+    ]);
+    let d = derive(&h, 0).unwrap();
+    assert_eq!(
+        d.graphs.stall,
+        vec![false, false, false, false],
+        "a first appearance must not flag: {:?}",
+        d.graphs.stall
+    );
+    // the busy fixture's own prefill lane confirms the condition held:
+    // 50 tokens/s on every interval after the first
+    assert_eq!(d.graphs.prefill.vals, vec![50.0, 50.0, 50.0, 50.0]);
+    assert_eq!(d.stalls[0].count, 0);
+    assert_eq!(d.stalls[2].count, 0);
+}
+
 // The stall bar is the median over the whole window, not the prefix
 // median at each interval: a collapse right at the start is flagged
 // by the graph ticks and the hero counters alike.
@@ -1313,8 +1378,8 @@ fn spec_accept_length_reads_the_latest_gauge() {
     assert_eq!(busy_derived().spec_accept_len, Some(3.25));
 }
 
-// TTFT quantiles from window bucket deltas, hand-computed. Deltas over
-// the window: 10 obs <= 0.1, 15 in (0.1, 1], 5 in (1, 10], total 30.
+// TTFT quantiles from window bucket deltas, hand-computed. Window
+// deltas: 10 obs <= 0.1, 15 in (0.1, 1], 5 in (1, 10], total 30.
 // p50 rank 15:  0.1 + 5/15 * 0.9 = 0.4
 // p95 rank 28.5: 1 + 3.5/5 * 9 = 7.3
 // p99 rank 29.7: 1 + 4.7/5 * 9 = 9.46
@@ -1549,9 +1614,45 @@ fn per_stream_uses_the_running_count_of_its_own_interval() {
     assert_eq!(d.gen_progress, Some(10.0));
 }
 
-// Session peaks only ever move up while one engine process runs: each
-// scrape folds max(existing, new rate). Deltas here climb 40, 80, 120,
-// 160 and then drop to 20, and the peaks must stay at the 160 interval.
+// Missing decode data must not read as a collapse. The per-stream
+// lane stays empty when the decode series is missing on either side,
+// even while requests ran throughout. A non-finite reading behaves
+// identically, because the parse boundary drops it before the scan
+// sees the series. The headline window rate stays gap-aware.
+#[test]
+fn per_stream_stores_no_speed_when_decode_data_is_missing() {
+    for variant in [BusyDecode::Absent, BusyDecode::NonFinite] {
+        let mut h = History::default();
+        let t0 = Instant::now();
+        for i in 0..6u32 {
+            let decode = if i == 2 { variant } else { BusyDecode::Normal };
+            h.push(
+                t0 + Duration::from_secs(u64::from(i)),
+                parse(&busy_body(i, decode)).unwrap(),
+            );
+        }
+        let d = derive(&h, 2).unwrap();
+        // intervals touching the missing sample pair nothing; healthy
+        // intervals around them read 40 tok/s across 4 requests
+        assert_eq!(
+            d.graphs.per_stream,
+            vec![Some(10.0), None, None, Some(10.0), Some(10.0)],
+            "per-stream speeds for {variant:?} were {:?}",
+            d.graphs.per_stream
+        );
+        // running was positive across the whole window, so the Nones
+        // are absence, not idleness
+        assert_eq!(d.running, Some(4.0));
+        // the headline rate pairs only healthy intervals: 3 x 40 tokens
+        // over the 5s span
+        assert_eq!(d.decode_rate[2], Some(24.0));
+    }
+}
+
+// Session peaks only ever move up while one engine process runs.
+// Each scrape folds max(existing, new rate) into the running peaks.
+// Deltas here climb 40, 80, 120, 160, then drop to 20, and the peaks
+// must stay at the 160 interval.
 #[test]
 fn session_peaks_only_grow_until_a_counter_reset() {
     use sgtop::derive::{update_peaks, Peaks};

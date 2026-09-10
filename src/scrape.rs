@@ -118,6 +118,42 @@ pub fn metrics_url(base: &str) -> String {
     }
 }
 
+/// Upper bound, in visible characters, of a display-bound error message.
+const MAX_ERROR_CHARS: usize = 256;
+
+/// Rewrites an error message so it is safe to print to a terminal.
+/// The message is hard-truncated to [`MAX_ERROR_CHARS`] characters with a trailing
+/// ellipsis marker; control characters become visible escape notation (C0, C1 and the delete byte all covered).
+///
+/// Parser bails embed `SeriesKey` label values verbatim, so a hostile
+/// endpoint can inject terminal control sequences through any labeled
+/// error. Every message bound for a terminal goes through this first,
+/// staying debuggable: family names, labels, and counts survive.
+///
+/// ```
+/// // an injected escape sequence renders as notation, sending no bytes
+/// assert_eq!(sgtop::scrape::sanitize_for_terminal("a\u{1b}[2Jb"), "a\\x1b[2Jb");
+/// ```
+pub fn sanitize_for_terminal(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len().min(MAX_ERROR_CHARS));
+    for c in msg.chars() {
+        let piece = match c {
+            '\n' => "\\n".to_owned(),
+            '\r' => "\\r".to_owned(),
+            '\t' => "\\t".to_owned(),
+            c if c.is_control() => format!("\\x{:02x}", u32::from(c)),
+            c => c.to_string(),
+        };
+        // one character reserved for the truncation marker
+        if out.chars().count() + piece.chars().count() > MAX_ERROR_CHARS - 1 {
+            out.push('\u{2026}');
+            return out;
+        }
+        out.push_str(&piece);
+    }
+    out
+}
+
 pub fn fetch_once(url: &str, api_key: Option<&str>, insecure: bool) -> Result<String> {
     let agent = agent(insecure, Duration::from_secs(5));
     fetch(&agent, url, api_key)
@@ -148,14 +184,16 @@ pub fn spawn_scraper(shared: Arc<Shared>, url: String, api_key: Option<String>, 
                         }
                     }
                     Err(e) => {
+                        // the message may embed hostile label values
+                        // (series keys render verbatim in parser bails)
                         if let Ok(mut slot) = shared.last_error.lock() {
-                            *slot = Some(format!("{e:#}"));
+                            *slot = Some(sanitize_for_terminal(&format!("{e:#}")));
                         }
                     }
                 },
                 Err(e) => {
                     if let Ok(mut slot) = shared.last_error.lock() {
-                        *slot = Some(format!("{e:#}"));
+                        *slot = Some(sanitize_for_terminal(&format!("{e:#}")));
                     }
                 }
             }
@@ -185,6 +223,35 @@ fn fetch(agent: &ureq::Agent, url: &str, api_key: Option<&str>) -> Result<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sanitize_escapes_control_characters_into_visible_notation() {
+        // terminal escape sequences, the delete byte, carriage returns,
+        // and an unescaped newline all become notation: the output
+        // carries no raw control byte
+        let safe = sanitize_for_terminal("m:h{mode=\"\u{1b}[2J\u{7f}\r\nx\"} too large");
+        assert!(!safe.chars().any(char::is_control), "message was: {safe:?}");
+        for notation in ["\\x1b", "\\x7f", "\\r", "\\n"] {
+            assert!(safe.contains(notation), "missing {notation}: {safe:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_truncates_overlong_messages_with_a_marker() {
+        let safe = sanitize_for_terminal(&"x".repeat(400));
+        assert_eq!(safe.chars().count(), MAX_ERROR_CHARS);
+        assert!(safe.ends_with('\u{2026}'), "message was: {safe:?}");
+        // a hostile payload cannot smuggle controls past the cut either
+        let hostile = sanitize_for_terminal(&format!("{}\u{1b}", "x".repeat(400)));
+        assert!(!hostile.chars().any(char::is_control));
+        assert!(hostile.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn sanitize_leaves_benign_messages_unchanged() {
+        let msg = "endpoint too large: m:h{mode=\"decode\"} has 257 buckets (cap 256)";
+        assert_eq!(sanitize_for_terminal(msg), msg);
+    }
 
     #[test]
     fn url_normalization() {

@@ -88,7 +88,10 @@ pub struct Graphs {
     pub pool_mamba: Vec<f64>,
     pub pool_host: Vec<f64>,
     pub pool_swa: Vec<f64>,
-    /// per-stream decode speed per interval (decode rate / running); None while idle
+    /// Per-stream decode speed per interval: the interval's decode rate
+    /// divided by its later sample's running count. None while idle.
+    /// Also None when the decode series is missing from either endpoint
+    /// sample (missing data never reads as a measured collapse).
     pub per_stream: Vec<Option<f64>>,
     /// interval durations in seconds, parallel to the vectors above
     pub dt: Vec<f64>,
@@ -304,12 +307,18 @@ impl Lane {
 /// Gaps: the parse boundary drops non-finite counter readings, so a NaN
 /// blink is a sample whose series is absent. Unreadable data is a gap,
 /// intended behavior rather than something to suppress. An interval
-/// leading out of such a sample pairs nothing (rate 0) and is flagged
-/// outright, and the running-count and prefill conditions still apply,
-/// so the red tick lands on the position of the unreadable sample.
-/// An interval where the absence starts (the later sample lacks the series) is not flagged: nothing measurable collapsed.
-/// The same per-pair absence rule drives the rate sums, so a counter
-/// that only moves across gap intervals shows a zero real rate.
+/// leading out of a gap pairs nothing (rate 0) and is flagged whenever
+/// the series was carried by an earlier window sample: evidence
+/// of a real gap (a reappearance, NaN blink, or ongoing absence),
+/// never a first appearance. The running-count and prefill
+/// conditions still apply, so the red tick lands on the position
+/// of the unreadable sample. A series never present in an earlier window
+/// sample (a first appearance) is not a stall: no collapse was ever
+/// observed, and a leading interval's zero rate is absence.
+/// An interval where the absence starts (the later sample lacks the series)
+/// is not flagged either: nothing measurable collapsed. The same
+/// per-pair absence rule drives the rate sums, so a counter that only
+/// moves across gap intervals shows a zero real rate.
 pub fn scan_window(h: &History) -> Graphs {
     let entries = h.window_entries(WINDOWS[2]);
     let mut decode = Lane::default();
@@ -321,6 +330,11 @@ pub fn scan_window(h: &History) -> Graphs {
     let mut pool_swa = Vec::new();
     let mut per_stream: Vec<Option<f64>> = Vec::new();
     let mut dt = Vec::new();
+    // gap intervals with evidence: the decode series existed in an earlier
+    // sample of the window, so an absent predecessor is a reappearance
+    // after a gap rather than a first appearance (never a stall)
+    let mut gap_after_seen: Vec<bool> = Vec::new();
+    let mut decode_seen = false;
 
     for pair in entries.windows(2) {
         let d = (pair[1].t - pair[0].t).as_secs_f64();
@@ -329,18 +343,27 @@ pub fn scan_window(h: &History) -> Graphs {
         }
         decode.push_interval(&pair[0].sample, &pair[1].sample, "decode", d);
         prefill.push_interval(&pair[0].sample, &pair[1].sample, "prefill_compute", d);
+        let reappearance = decode.absent_old.last() == Some(&true) && decode_seen;
+        gap_after_seen.push(reappearance);
+        // the pair's earlier sample counts as evidence for the next interval
+        decode_seen |= decode.absent_old.last() != Some(&true);
         let running_at = pair[1]
             .sample
             .gauge("sglang:num_running_reqs")
             .unwrap_or(0.0);
         running.push(running_at);
-        per_stream.push(if running_at > 0.0 {
+        // an absent decode endpoint leaves the lane's rate at 0. Displayed
+        // against a positive running count, that absence reads as a measured
+        // collapse: missing data stores no speed instead
+        let decode_missing =
+            decode.absent_old.last() == Some(&true) || decode.absent_new.last() == Some(&true);
+        per_stream.push(if running_at > 0.0 && !decode_missing {
             Some(decode.vals.last().copied().unwrap_or(0.0) / running_at)
         } else {
             None
         });
-        // lanes are computed from raw counts so the graph matches the
-        // title values; mamba_usage measures pages, not slots
+        // lanes use raw counts, so graph and title values agree
+        // (mamba_usage measures pages, not slots)
         let s = &pair[1].sample;
         pool_kv.push(
             s.gauge("sglang:kv_used_tokens")
@@ -393,8 +416,10 @@ pub fn scan_window(h: &History) -> Graphs {
         .map(|i| {
             running[i] > 0.0
                 && prefill.vals[i] > 0.0
-                && (decode.absent_old[i]
-                    || (!decode.absent_new[i] && decode.vals[i] < 0.25 * median))
+                && (gap_after_seen[i]
+                    || (!decode.absent_old[i]
+                        && !decode.absent_new[i]
+                        && decode.vals[i] < 0.25 * median))
         })
         .collect();
 
