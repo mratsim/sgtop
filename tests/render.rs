@@ -27,6 +27,7 @@ fn shared_with_fixture() -> Arc<Shared> {
             prefill: Some(812.0),
             decode_single: Some(134.0),
         }),
+        alarms: Mutex::new(sgtop::derive::Alarms::default()),
     };
     let mut h = shared.history.lock().unwrap();
     // two samples one scrape apart, the second with a distinct decode
@@ -55,6 +56,7 @@ fn shared_with_bodies(bodies: &[String]) -> Arc<Shared> {
         paused: AtomicBool::new(false),
         interval_ms: std::sync::atomic::AtomicU64::new(1000),
         peaks: Mutex::new(sgtop::derive::Peaks::default()),
+        alarms: Mutex::new(sgtop::derive::Alarms::default()),
     };
     let mut h = shared.history.lock().unwrap();
     let t0 = Instant::now();
@@ -107,17 +109,182 @@ fn full_layout_renders_key_panels() {
     assert!(out.contains("sgtop"), "header missing");
     assert!(out.contains("glm-5.3-flash"), "model missing");
     assert!(out.contains("RUNNING"), "hero missing");
+    // hero rework: running | queue | token/s | time-to-first-token |
+    // stalls | memory pools last, with the pools value absolute-only
+    assert!(out.contains("TOKEN/s"), "token/s hero cell missing");
+    // the generation rows carry the generated (past/accumulation) wording
+    assert!(
+        out.contains("agg tok generated"),
+        "agg tok generated row missing:\n{out}"
+    );
+    assert!(
+        out.contains("avg tok generated"),
+        "avg tok generated row missing:\n{out}"
+    );
+    assert!(
+        out.contains("in-flight request stats"),
+        "Generation caption missing:\n{out}"
+    );
+    assert!(
+        out.contains("TIME TO FIRST TOKEN"),
+        "ttft hero cell missing"
+    );
+    assert!(
+        out.contains("full = requests queue"),
+        "pools occupancy gloss missing"
+    );
+    // each pool renders on its own line, never joined by
+    // " · " on a truncated row; the KV line leads the pool block
+    let kv_line = out
+        .lines()
+        .find(|l| l.contains("KV 0/655k tok"))
+        .expect("KV pool line missing");
+    assert!(
+        !kv_line.contains("mamba"),
+        "pool readings must not share a line:\n{kv_line}"
+    );
+    assert!(
+        out.contains("mamba 0/4 slots"),
+        "mamba pool line missing:\n{out}"
+    );
+    assert!(
+        !out.contains("KV 0/655k tok ·"),
+        "the joined pool line is back"
+    );
+    // the hero prompt gloss is the full pair on its own hero line.
+    // A bare contains check would pass via the latency subtitle
+    // alone, so the wide hero row pin below carries the assertion
+    assert!(
+        out.contains("prompt 16.5k–85.0k"),
+        "prompt gloss missing from the render"
+    );
+    // the cache-misses plot replaced the queue plot in the latency row
+    assert!(out.contains("Cache misses"), "cache-misses plot missing");
+    assert!(
+        !out.contains("Waiting lines"),
+        "waiting-lines panel still rendered"
+    );
+    // the plot subtitles carry the split size gloss: the prompt half
+    // rides the TTFT plot, the computed half the cache-misses plot
+    // (the latency subtitle holds the full pair, so the computed half needs two hits)
+    assert!(
+        out.contains("prompt 16.5k–85.0k tok"),
+        "TTFT plot subtitle prompt gloss missing:\n{out}"
+    );
+    assert!(
+        out.matches("computed 357–8.8k tok").count() >= 2,
+        "cache-misses plot subtitle computed gloss missing:\n{out}"
+    );
+    // the Cache panel's cached/computed throughput line renders
+    assert!(
+        out.contains("cached·computed"),
+        "CACHE panel cached/computed line missing:\n{out}"
+    );
     assert!(out.contains("Prefill"), "prefill graph missing");
     assert!(out.contains("Decode"), "decode graph missing");
-    assert!(out.contains("Speed per stream"), "per-stream graph missing");
-    assert!(out.contains("Memory pools"), "pools missing");
-    assert!(out.contains("KV"), "KV pool missing");
-    assert!(out.contains("mamba"), "mamba pool missing");
+    assert!(
+        out.contains("aggregate · single-stream"),
+        "decode two-line legend missing"
+    );
+    assert!(out.contains("TTFT"), "TTFT plot missing");
+    // the pool graphs are gone; the pools text stays, absolute only
+    assert!(!out.contains("Speed per stream"), "stale per-stream panel");
+    assert!(
+        !out.contains("host full is normal"),
+        "stale pools-graph subtitle"
+    );
+    assert!(out.contains("MEMORY POOLS"), "hero pools cell missing");
+    assert!(out.contains("0/655k tok"), "KV absolute counts missing");
     assert!(out.contains("Latency"), "latency panel missing");
     assert!(out.contains("p50"), "percentiles missing");
     assert!(out.contains("Health & trouble"), "health panel missing");
     assert!(out.contains("Peaks"), "peaks panel missing");
     assert!(out.contains("402 tok/s"), "peak decode missing");
+}
+
+// The hero cells render left to right in the pinned order: running, queue,
+// token/s (double width), time to first token, stalls, memory pools last.
+// The hero's pair gloss must render un-truncated on the hero's own line:
+// at 120 cols the token/s cell clips it, so the pin renders wide and looks
+// only at the hero band (rows 1-6), where no other panel joins the pair.
+#[test]
+fn hero_pair_gloss_renders_untruncated_on_the_hero_row() {
+    let wide = render_at(160, 30, Overlay::None);
+    let pair = "prompt 16.5k–85.0k · computed 357–8.8k tok";
+    let hero_has_pair = wide
+        .lines()
+        .enumerate()
+        .take(7)
+        .skip(1)
+        .any(|(_, line)| line.contains(pair));
+    assert!(hero_has_pair, "hero pair gloss missing or clipped:\n{wide}");
+}
+
+#[test]
+fn hero_cells_render_in_the_pinned_order() {
+    let out = render_at(120, 30, Overlay::None);
+    let pos = |needle: &str| {
+        out.find(needle)
+            .unwrap_or_else(|| panic!("hero label {needle} missing:\n{out}"))
+    };
+    let running = pos("RUNNING");
+    let queue = pos("QUEUE");
+    let rates = pos("TOKEN/s");
+    let ttft = pos("TIME TO FIRST TOKEN");
+    let stalls = pos("STALLS");
+    let pools = pos("MEMORY POOLS");
+    assert!(running < queue, "RUNNING must precede QUEUE");
+    assert!(queue < rates, "QUEUE must precede TOKEN/s");
+    assert!(rates < ttft, "TOKEN/s must precede TIME TO FIRST TOKEN");
+    assert!(ttft < stalls, "TIME TO FIRST TOKEN must precede STALLS");
+    assert!(stalls < pools, "STALLS must precede MEMORY POOLS");
+}
+
+// The health strip's alarm rows collapse into one dim line while quiet,
+// then regain their full colored row after the channel's first firing.
+// The latch is session-sticky: a fired alarm stays visible.
+#[test]
+fn alarm_rows_collapse_while_quiet_and_fire_full() {
+    let quiet = render_at(120, 30, Overlay::None);
+    assert!(
+        quiet.contains("quiet: retraction·503·l2 drop"),
+        "quiet alarm line missing:\n{quiet}"
+    );
+    assert!(
+        !quiet.contains("retractions/s"),
+        "a quiet alarm must not render its full row"
+    );
+
+    // the same fixture with the retraction channel latched: its row returns
+    let shared = shared_with_fixture();
+    *shared.alarms.lock().unwrap() = sgtop::derive::Alarms {
+        retraction: true,
+        ..sgtop::derive::Alarms::default()
+    };
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &ui_default(), &shared)).unwrap();
+    let mut out = String::new();
+    for row in 0..30 {
+        for col in 0..120 {
+            out.push(
+                terminal.backend().buffer()[(col, row)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
+        }
+        out.push('\n');
+    }
+    assert!(
+        out.contains("retractions/s"),
+        "a fired alarm must render its full row:\n{out}"
+    );
+    assert!(
+        out.contains("quiet: 503·l2 drop"),
+        "the fired channel must leave the quiet line:\n{out}"
+    );
 }
 
 #[test]
@@ -243,7 +410,7 @@ fn narrow_full_layout_truncates_with_ellipsis() {
         "expected truncated lines with ellipsis:\n{out}"
     );
     // no line may overflow its panel border (wrap would have pushed content down)
-    assert!(out.contains("Answer quality"));
+    assert!(out.contains("Generation"));
     assert!(out.contains("Health & trouble"));
 }
 
@@ -294,6 +461,65 @@ fn non_finite_gauge_reading_renders_as_no_data() {
     }
 }
 
+// The latency plots carry labeled y-gridlines like the rate graphs do,
+// working at any magnitude: a sub-second TTFT scale labels its seconds
+// (0.1s), a tok/s scale labels k-formatted rates (10 tok/s). The sparse
+// 2-sample fixture leaves both plots without data, so this fixture feeds
+// four samples one scrape apart with real traffic.
+#[test]
+fn latency_plots_carry_labeled_gridlines_at_any_magnitude() {
+    let body = |i: u32| {
+        format!(
+            "# TYPE sglang:time_to_first_token_seconds histogram\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"0.1\"}} {}\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"0.2\"}} {}\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"0.4\"}} {}\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"+Inf\"}} {}\n\
+             sglang:time_to_first_token_seconds_count {}\n\
+             # TYPE sglang:prefill_effective_tokens_total counter\n\
+             sglang:prefill_effective_tokens_total{{mode=\"input\"}} {}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 2\n",
+            2.0 * f64::from(i),
+            5.0 * f64::from(i),
+            6.0 * f64::from(i),
+            6.0 * f64::from(i),
+            6.0 * f64::from(i),
+            10.0 * f64::from(i)
+        )
+    };
+    let bodies: Vec<String> = (0..4).map(body).collect();
+    let shared = shared_with_bodies(&bodies);
+    let backend = TestBackend::new(120, 30);
+    let mut terminal = Terminal::new(backend).unwrap();
+    terminal.draw(|f| draw(f, &ui_default(), &shared)).unwrap();
+    let mut out = String::new();
+    for row in 0..30 {
+        for col in 0..120 {
+            out.push(
+                terminal.backend().buffer()[(col, row)]
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap_or(' '),
+            );
+        }
+        out.push('\n');
+    }
+    // the TTFT p95 lands at 0.34s, so a 0.1-step ladder prints "0.1s":
+    // the sub-second regime an integer-only scale had left unlabeled
+    assert!(
+        out.contains("0.1s"),
+        "fractional ttft gridline label missing:\n{out}"
+    );
+    // the cache-miss lane runs at 10 computed tok/s: the 10-step gridline
+    // labels "10 tok/s"
+    assert!(
+        out.contains("10 tok/s"),
+        "cache-miss gridline label missing:\n{out}"
+    );
+}
+
 // The very first frame, before any scrape has landed, shows a stable
 // zero state: the panels and their placeholders draw without panic,
 // no graph is plotted from an empty ring, and no fabricated numbers
@@ -308,6 +534,7 @@ fn cold_start_frame_renders_a_stable_zero_state() {
             paused: AtomicBool::new(false),
             interval_ms: std::sync::atomic::AtomicU64::new(1000),
             peaks: Mutex::new(sgtop::derive::Peaks::default()),
+            alarms: Mutex::new(sgtop::derive::Alarms::default()),
         })
     };
     let render = |cols: u16, rows: u16, shared: &Arc<Shared>| {

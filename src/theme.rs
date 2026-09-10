@@ -14,6 +14,9 @@ pub struct Theme {
     pub s1: Color,
     /// secondary graph series (prefill)
     pub s2: Color,
+    /// tertiary graph series (the single-stream overlay): must contrast
+    /// strongly with s1, since the two share the decode canvas
+    pub s3: Color,
 }
 
 pub const THEMES: [Theme; 3] = [GRUVBOX, CATPPUCCIN, TOKYONIGHT];
@@ -29,6 +32,7 @@ pub const GRUVBOX: Theme = Theme {
     bad: Color::Rgb(0xfb, 0x49, 0x34),
     s1: Color::Rgb(0x8e, 0xc0, 0x7c),
     s2: Color::Rgb(0xd3, 0x86, 0x9b),
+    s3: Color::Rgb(0xfa, 0xbd, 0x2f),
 };
 
 pub const CATPPUCCIN: Theme = Theme {
@@ -42,6 +46,7 @@ pub const CATPPUCCIN: Theme = Theme {
     bad: Color::Rgb(0xf3, 0x8b, 0xa8),
     s1: Color::Rgb(0x94, 0xe2, 0xd5),
     s2: Color::Rgb(0xf5, 0xc2, 0xe7),
+    s3: Color::Rgb(0xf9, 0xe2, 0xaf),
 };
 
 pub const TOKYONIGHT: Theme = Theme {
@@ -55,6 +60,7 @@ pub const TOKYONIGHT: Theme = Theme {
     bad: Color::Rgb(0xf7, 0x76, 0x8e),
     s1: Color::Rgb(0x73, 0xda, 0xca),
     s2: Color::Rgb(0xbb, 0x9a, 0xf7),
+    s3: Color::Rgb(0xff, 0x9e, 0x64),
 };
 
 /// Color ramp for usage-style ratios: calm when healthy, loud near full.

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::history::{counter_delta, History};
+use crate::history::{counter_delta, hist_window_p95, History};
 use crate::metrics::{Sample, SeriesKey};
 
 pub const WINDOWS: [Duration; 3] = [
@@ -23,6 +23,37 @@ fn fam_labeled(
     move |k: &SeriesKey| k.name == name && k.has_label(lk, lv)
 }
 
+/// sglang realtime throughput counter family, mode-labeled.
+const TOKENS_TOTAL: &str = "sglang:realtime_tokens_total";
+
+fn decode_lane() -> impl Fn(&SeriesKey) -> bool + Copy {
+    fam_labeled(TOKENS_TOTAL, "mode", "decode")
+}
+
+fn prefill_lane() -> impl Fn(&SeriesKey) -> bool + Copy {
+    fam_labeled(TOKENS_TOTAL, "mode", "prefill_compute")
+}
+
+/// Effective-prefill counter family; its non-hit `input` mode counts the uncached prompt tokens.
+const EFFECTIVE_TOTAL: &str = "sglang:prefill_effective_tokens_total";
+
+fn input_lane() -> impl Fn(&SeriesKey) -> bool + Copy {
+    fam_labeled(EFFECTIVE_TOTAL, "mode", "input")
+}
+
+/// `mode` labels of the effective-prefill counter that count as cache hits:
+/// the single vocabulary the cached-rate lane and the per-tier L2 rates
+/// read (a new exporter mode is added here once, for every consumer).
+const EFFECTIVE_HIT_MODES: &[&str] = &["device_hit", "host_hit", "storage_hit"];
+
+/// Effective-prefill hit modes, summed: prompt tokens the prefix cache
+/// served (device, host, or storage tier).
+fn any_hit_lane() -> impl Fn(&SeriesKey) -> bool + Copy {
+    move |k: &SeriesKey| {
+        k.name == EFFECTIVE_TOTAL && EFFECTIVE_HIT_MODES.iter().any(|m| k.has_label("mode", m))
+    }
+}
+
 /// One cache pool (KV / mamba / SWA / host) with its current usage ratio.
 #[derive(Clone, Copy)]
 pub struct Pool {
@@ -32,8 +63,7 @@ pub struct Pool {
     /// exposes them (engine-wide, summed across ranks)
     pub used: Option<f64>,
     pub total: Option<f64>,
-    /// what the counts count: "tokens" for KV/host, "slots" for
-    /// state pools (mamba, SWA)
+    /// what the counts count: "tokens" for token pools, "slots" for mamba.
     pub unit: &'static str,
 }
 
@@ -83,11 +113,21 @@ pub struct Graphs {
     pub prefill: Lane,
     /// flagged intervals (see the stall definition on `scan_window`)
     pub stall: Vec<bool>,
-    /// per-pool usage ratios (0–1) per scrape: KV / mamba / SWA / host
-    pub pool_kv: Vec<f64>,
-    pub pool_mamba: Vec<f64>,
-    pub pool_host: Vec<f64>,
-    pub pool_swa: Vec<f64>,
+    /// Evicted device-KV tokens/s per scrape interval, under the rate lanes' gap-aware
+    /// pairing; an interval with a positive value draws an eviction tick on the latency plots.
+    pub evictions: Lane,
+    /// Time-to-first-token per interval position, in seconds: the wait for the first token
+    /// (queue + prefill). Cumulative bucket counters make each position's quantile the delta
+    /// between the window's first sample and the position's later sample, so the newest point
+    /// is the window's headline quantile. None while that span is too sparse to interpolate
+    /// (`hist_window_p95`): a gap in the plot is absence of measured data, never a zero.
+    pub ttft_p95: Vec<Option<f64>>,
+    /// Computed prompt tokens/s per scrape interval: the effective-prefill
+    /// counter's `input` mode, the prompt text the prefix cache did not hold
+    /// (the cache misses the device chewed). An interval whose endpoint
+    /// samples lack the counter family stores None, a gap in the plot:
+    /// a zero bar means a present counter was measured at zero.
+    pub cache_misses: Vec<Option<f64>>,
     /// Per-stream decode speed per interval: the interval's decode rate
     /// divided by its later sample's running count. None while idle.
     /// Also None when the decode series is missing from either endpoint
@@ -105,7 +145,6 @@ pub struct Derived {
     pub engine: String,
     pub running: Option<f64>,
     pub queue: Option<f64>,
-    pub subqueues: Vec<(&'static str, Option<f64>)>,
     pub decode_rate: Triple,
     /// instantaneous decode rate (most recent scrape interval)
     pub decode_instant: Option<f64>,
@@ -113,7 +152,15 @@ pub struct Derived {
     pub prefill_instant: Option<f64>,
     pub prefill_rate: Triple,
     pub pools: Vec<Pool>,
+    /// Prefix-cache hit fraction: rate of the effective-prefill counter's
+    /// hit modes over all its modes (60s window); the engine's
+    /// cache_hit_rate gauge is the fallback while the family is absent.
     pub cache_hit: Option<f64>,
+    /// Cached and computed prompt throughput over the 60s window, in tok/s:
+    /// the counter's hit modes summed, and its `input` mode, the cache misses
+    /// the device chewed. Present once the counter family exists.
+    pub cache_cached: Option<f64>,
+    pub cache_computed: Option<f64>,
     pub spec_accept: Option<f64>,
     pub spec_accept_len: Option<f64>,
     pub ttft: LatencyTriple,
@@ -122,12 +169,14 @@ pub struct Derived {
     pub queue_time: LatencyTriple,
     pub prompt_len_p50: Option<f64>,
     pub prompt_len_p95: Option<f64>,
+    /// Uncached (computed) prompt length p50/p95, tokens: the pair gloss's
+    /// second half, the size of the work the prefix cache did not absorb.
+    pub computed_p50: Option<f64>,
+    pub computed_p95: Option<f64>,
     pub stalls: [Stalls; 3],
     pub evict_rate: Option<f64>,
     pub retract_rate: Option<f64>,
     pub http_503_rate: Option<f64>,
-    pub http_active: Option<f64>,
-    pub gen_throughput_gauge: Option<f64>,
     /// L2/HiCache: per-tier prefill hit rates (fraction of prefill tokens
     /// served from device/host tier, windowed)
     pub l2_device: Option<f64>,
@@ -137,7 +186,9 @@ pub struct Derived {
     pub l2_rb: Option<f64>,
     /// device KV tokens/s destroyed without a host backup (should be 0)
     pub l2_drop: Option<f64>,
-    pub new_token_ratio: Option<f64>,
+    /// generated tokens (sum) over the currently running requests, read
+    /// from the engine's decode sequence-length sum
+    pub gen_total: Option<f64>,
     /// average generation length (tokens) of currently running requests
     pub gen_progress: Option<f64>,
     pub cpu_tokenizer: Option<f64>,
@@ -202,9 +253,75 @@ pub struct Peaks {
     pub decode_single: Option<f64>,
 }
 
+/// Session-sticky alarm latches for the health strip. Each channel flips
+/// true the first time its per-interval rate reads nonzero and stays latched
+/// for the rest of the session: a quiet alarm collapses into the dim
+/// summary line, a fired one regains its full row immediately.
+#[derive(Default, Clone, Copy)]
+pub struct Alarms {
+    pub retraction: bool,
+    pub http_503: bool,
+    pub l2_drop: bool,
+}
+
+/// Latch any alarm channel once a scrape interval measured a nonzero rate.
+/// Runs beside `update_peaks` on every pushed sample.
+pub fn update_alarms(alarms: &mut Alarms, h: &History) {
+    let n = h.len();
+    if n < 2 {
+        return;
+    }
+    let (Some(prev), Some(cur)) = (h.get(n - 2), h.get(n - 1)) else {
+        return;
+    };
+    let dt = (cur.t - prev.t).as_secs_f64();
+    if dt <= 0.0 {
+        return;
+    }
+    if tokens_had_reset(&prev.sample, &cur.sample) {
+        // the engine restarted: the old process's alarms are not the new
+        // process's alarms
+        *alarms = Alarms::default();
+        return;
+    }
+    macro_rules! latch {
+        ($field:ident, $pred:expr) => {
+            if counter_rate(&prev.sample, &cur.sample, $pred) / dt > 0.0 {
+                alarms.$field = true;
+            }
+        };
+    }
+    latch!(retraction, fam("sglang:num_retracted_reqs"));
+    latch!(
+        http_503,
+        fam_labeled("sglang:http_responses_total", "status_code", "503")
+    );
+    latch!(l2_drop, fam("sglang:hicache_dropped_tokens_total"));
+}
+
 /// Fold the most recent scrape interval into the session peaks. A counter
 /// reset (engine restart) clears all session peaks, since the old process's
 /// peaks are not this engine's.
+/// True when a realtime-token counter dropped between the two samples:
+/// the engine restarted and its counters began again, so session-sticky
+/// state (peaks, alarm latches) belongs to the previous process.
+fn tokens_had_reset(prev: &Sample, cur: &Sample) -> bool {
+    ["decode", "prefill_compute"].iter().any(|mode| {
+        let keys = |s: &Sample| {
+            s.simple
+                .iter()
+                .filter(|(k, _)| {
+                    k.name == "sglang:realtime_tokens_total" && k.has_label("mode", mode)
+                })
+                .map(|(k, v)| (k.clone(), *v))
+                .collect::<Vec<_>>()
+        };
+        keys(prev)
+            .iter()
+            .any(|(k, v_old)| cur.simple.get(k).map(|v| v < v_old).unwrap_or(false))
+    })
+}
+
 pub fn update_peaks(peaks: &mut Peaks, h: &History) {
     let n = h.len();
     if n < 2 {
@@ -217,28 +334,22 @@ pub fn update_peaks(peaks: &mut Peaks, h: &History) {
     if dt <= 0.0 {
         return;
     }
-    let had_reset = ["decode", "prefill_compute"].iter().any(|mode| {
-        let keys = |s: &Sample| {
-            s.simple
-                .iter()
-                .filter(|(k, _)| {
-                    k.name == "sglang:realtime_tokens_total" && k.has_label("mode", mode)
-                })
-                .map(|(k, v)| (k.clone(), *v))
-                .collect::<Vec<_>>()
-        };
-        keys(&prev.sample)
-            .iter()
-            .any(|(k, v_old)| cur.sample.simple.get(k).map(|v| v < v_old).unwrap_or(false))
-    });
-    if had_reset {
+    if tokens_had_reset(&prev.sample, &cur.sample) {
         // the engine restarted: the old process's peaks are not this
         // engine's peaks
         *peaks = Peaks::default();
         return;
     }
-    let decode = interval_rate(&prev.sample, &cur.sample, "decode") / dt;
-    let prefill = interval_rate(&prev.sample, &cur.sample, "prefill_compute") / dt;
+    let decode = counter_rate(
+        &prev.sample,
+        &cur.sample,
+        fam_labeled(TOKENS_TOTAL, "mode", "decode"),
+    ) / dt;
+    let prefill = counter_rate(
+        &prev.sample,
+        &cur.sample,
+        fam_labeled(TOKENS_TOTAL, "mode", "prefill_compute"),
+    ) / dt;
     if decode > peaks.decode.unwrap_or(0.0) {
         peaks.decode = Some(decode);
     }
@@ -254,11 +365,10 @@ pub fn update_peaks(peaks: &mut Peaks, h: &History) {
     }
 }
 
-fn interval_rate(old: &crate::metrics::Sample, new: &crate::metrics::Sample, mode: &str) -> f64 {
-    let key = |k: &SeriesKey| k.name == "sglang:realtime_tokens_total" && k.has_label("mode", mode);
+fn counter_rate(old: &Sample, new: &Sample, of_series: impl Fn(&SeriesKey) -> bool + Copy) -> f64 {
     let mut delta = 0.0;
     for (k, v_new) in &new.simple {
-        if key(k) {
+        if of_series(k) {
             // a key absent from the earlier sample is a new series
             // (first appearance, or reappearance after a gap): never
             // pair it with a pre-gap sample, so no fabricated spike
@@ -275,12 +385,16 @@ fn interval_rate(old: &crate::metrics::Sample, new: &crate::metrics::Sample, mod
 impl Lane {
     /// Append one scrape interval: the paired counter deltas over `dt`
     /// become the rate, or 0 when the series is missing at one end.
-    fn push_interval(&mut self, old: &Sample, new: &Sample, mode: &str, dt: f64) {
-        let of_mode =
-            |k: &SeriesKey| k.name == "sglang:realtime_tokens_total" && k.has_label("mode", mode);
-        self.vals.push(interval_rate(old, new, mode) / dt);
-        self.absent_old.push(!old.simple.keys().any(of_mode));
-        self.absent_new.push(!new.simple.keys().any(of_mode));
+    fn push_interval(
+        &mut self,
+        old: &Sample,
+        new: &Sample,
+        of_series: impl Fn(&SeriesKey) -> bool + Copy,
+        dt: f64,
+    ) {
+        self.vals.push(counter_rate(old, new, of_series) / dt);
+        self.absent_old.push(!old.simple.keys().any(of_series));
+        self.absent_new.push(!new.simple.keys().any(of_series));
     }
 }
 
@@ -323,11 +437,10 @@ pub fn scan_window(h: &History) -> Graphs {
     let entries = h.window_entries(WINDOWS[2]);
     let mut decode = Lane::default();
     let mut prefill = Lane::default();
+    let mut evictions = Lane::default();
     let mut running: Vec<f64> = Vec::new();
-    let mut pool_kv = Vec::new();
-    let mut pool_mamba = Vec::new();
-    let mut pool_host = Vec::new();
-    let mut pool_swa = Vec::new();
+    let mut ttft_p95: Vec<Option<f64>> = Vec::new();
+    let mut cache_misses: Vec<Option<f64>> = Vec::new();
     let mut per_stream: Vec<Option<f64>> = Vec::new();
     let mut dt = Vec::new();
     // gap intervals with evidence: the decode series existed in an earlier
@@ -341,8 +454,24 @@ pub fn scan_window(h: &History) -> Graphs {
         if d <= 0.0 {
             continue;
         }
-        decode.push_interval(&pair[0].sample, &pair[1].sample, "decode", d);
-        prefill.push_interval(&pair[0].sample, &pair[1].sample, "prefill_compute", d);
+        decode.push_interval(&pair[0].sample, &pair[1].sample, decode_lane(), d);
+        prefill.push_interval(&pair[0].sample, &pair[1].sample, prefill_lane(), d);
+        evictions.push_interval(
+            &pair[0].sample,
+            &pair[1].sample,
+            fam("sglang:evicted_tokens_total"),
+            d,
+        );
+        // a missing counter family stores a gap, never a measured zero:
+        // the rate lanes keep their 0-on-absence convention for the stall
+        // fold, while the misses plot has no such consumer
+        let misses_absent = !pair[0].sample.simple.keys().any(input_lane())
+            || !pair[1].sample.simple.keys().any(input_lane());
+        cache_misses.push(if misses_absent {
+            None
+        } else {
+            Some(counter_rate(&pair[0].sample, &pair[1].sample, input_lane()) / d)
+        });
         let reappearance = decode.absent_old.last() == Some(&true) && decode_seen;
         gap_after_seen.push(reappearance);
         // the pair's earlier sample counts as evidence for the next interval
@@ -362,50 +491,15 @@ pub fn scan_window(h: &History) -> Graphs {
         } else {
             None
         });
-        // lanes use raw counts, so graph and title values agree
-        // (mamba_usage measures pages, not slots)
-        let s = &pair[1].sample;
-        pool_kv.push(
-            s.gauge("sglang:kv_used_tokens")
-                .zip(s.gauge("sglang:max_total_num_tokens"))
-                .filter(|(_, t)| *t > 0.0)
-                .map(|(u, t)| (u / t).clamp(0.0, 1.0))
-                .unwrap_or(0.0),
+        // per-position latency: each point is the histogram bucket delta between the window's
+        // first sample and this interval's later sample; the series starts sparse and ends
+        // at the headline quantile
+        let t95 = hist_window_p95(
+            &entries[0].sample,
+            &pair[1].sample,
+            &fam("sglang:time_to_first_token_seconds"),
         );
-        pool_mamba.push(
-            s.gauge("sglang:mamba_used_tokens")
-                .map(|u| {
-                    let total = u + s.gauge("sglang:mamba_available_tokens").unwrap_or(0.0);
-                    if total > 0.0 {
-                        (u / total).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                })
-                .unwrap_or(0.0),
-        );
-        pool_host.push(
-            match (
-                s.gauge("sglang:hicache_host_total_tokens"),
-                s.gauge("sglang:hicache_host_used_tokens"),
-            ) {
-                (Some(total), Some(used)) if total > 0.0 => used / total,
-                _ => 0.0,
-            },
-        );
-        pool_swa.push(
-            s.gauge("sglang:swa_used_tokens")
-                .map(|u| {
-                    let total = u + s.gauge("sglang:swa_available_tokens").unwrap_or(0.0);
-                    if total > 0.0 {
-                        (u / total).clamp(0.0, 1.0)
-                    } else {
-                        0.0
-                    }
-                })
-                .unwrap_or(0.0),
-        );
-
+        ttft_p95.push(t95);
         dt.push(d);
     }
 
@@ -427,10 +521,9 @@ pub fn scan_window(h: &History) -> Graphs {
         decode,
         prefill,
         stall,
-        pool_kv,
-        pool_mamba,
-        pool_host,
-        pool_swa,
+        evictions,
+        cache_misses,
+        ttft_p95,
         per_stream,
         dt,
     }
@@ -478,29 +571,6 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
     let last = h.last()?;
     let running = h.gauge_pred(fam("sglang:num_running_reqs"));
     let queue = h.gauge_pred(fam("sglang:num_queue_reqs"));
-
-    let subqueues: Vec<(&'static str, Option<f64>)> = vec![
-        (
-            "prefill bootstrap",
-            h.gauge_pred(fam("sglang:num_prefill_bootstrap_queue_reqs")),
-        ),
-        (
-            "prefill inflight",
-            h.gauge_pred(fam("sglang:num_prefill_inflight_queue_reqs")),
-        ),
-        (
-            "decode prealloc",
-            h.gauge_pred(fam("sglang:num_decode_prealloc_queue_reqs")),
-        ),
-        (
-            "decode transfer",
-            h.gauge_pred(fam("sglang:num_decode_transfer_queue_reqs")),
-        ),
-        (
-            "grammar",
-            h.gauge_pred(fam("sglang:num_grammar_queue_reqs")),
-        ),
-    ];
 
     // pools: KV always, mamba/SWA once the engine has reported pool data
     // inside the 60s window (sticky, so idle lapses within the window
@@ -585,7 +655,7 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
             usage,
             used,
             total,
-            unit: "slots",
+            unit: "tokens",
         });
     }
     // host (L2) tier pool — present once the engine allocates host capacity
@@ -642,6 +712,27 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
     let queue_time = latency_triple(h, "sglang:queue_time_seconds");
     let prompt_len_p50 = h.hist_quantile(fam("sglang:prompt_tokens_histogram"), 0.50, WINDOWS[2]);
     let prompt_len_p95 = h.hist_quantile(fam("sglang:prompt_tokens_histogram"), 0.95, WINDOWS[2]);
+    let computed_p50 = h.hist_quantile(
+        fam("sglang:uncached_prompt_tokens_histogram"),
+        0.50,
+        WINDOWS[2],
+    );
+    let computed_p95 = h.hist_quantile(
+        fam("sglang:uncached_prompt_tokens_histogram"),
+        0.95,
+        WINDOWS[2],
+    );
+    // windowed prefix-cache hit fraction over the effective-prefill counter's
+    // modes, per the exporter's documented formula; the counter only updates
+    // on the engine's log interval, so the 60s window is the meaningful span.
+    // The engine gauge serves as fallback for exporters without the counter.
+    let cache_cached = h.rate_sum(any_hit_lane(), WINDOWS[2]);
+    let cache_computed = h.rate_sum(input_lane(), WINDOWS[2]);
+    let eff_total = h.rate_sum(fam(EFFECTIVE_TOTAL), WINDOWS[2]);
+    let cache_hit = match (cache_cached, eff_total) {
+        (Some(c), Some(t)) if t > 0.0 => Some((c / t).clamp(0.0, 1.0)),
+        _ => h.gauge_pred(fam("sglang:cache_hit_rate")),
+    };
 
     let graphs = h.scan().cloned()?;
     let stalls = fold_stalls(&graphs.stall, &graphs.dt);
@@ -670,11 +761,12 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
         engine,
         running,
         queue,
-        subqueues,
         decode_rate,
         prefill_rate,
         pools,
-        cache_hit: h.gauge_pred(fam("sglang:cache_hit_rate")),
+        cache_hit,
+        cache_cached,
+        cache_computed,
         spec_accept: h.gauge_pred(fam("sglang:spec_accept_rate")),
         spec_accept_len: h.gauge_pred(fam("sglang:spec_accept_length")),
         ttft,
@@ -683,18 +775,18 @@ pub fn derive(h: &History, window_focus: usize) -> Option<Derived> {
         queue_time,
         prompt_len_p50,
         prompt_len_p95,
+        computed_p50,
+        computed_p95,
         stalls,
         evict_rate,
         retract_rate,
         http_503_rate,
-        http_active: h.gauge_pred(fam("sglang:http_requests_active")),
-        gen_throughput_gauge: h.gauge_pred(fam("sglang:gen_throughput")),
-        l2_device: l2_hit_rate(h, "device_hit"),
-        l2_host: l2_hit_rate(h, "host_hit"),
+        l2_device: l2_hit_rate(h, EFFECTIVE_HIT_MODES[0]),
+        l2_host: l2_hit_rate(h, EFFECTIVE_HIT_MODES[1]),
         l2_wb: h.rate_sum(fam("sglang:hicache_backup_tokens_total"), WINDOWS[2]),
         l2_rb: h.rate_sum(fam("sglang:load_back_tokens_total"), WINDOWS[2]),
         l2_drop: h.rate_sum(fam("sglang:hicache_dropped_tokens_total"), WINDOWS[2]),
-        new_token_ratio: h.gauge_pred(fam("sglang:new_token_ratio")),
+        gen_total: h.gauge_pred(fam("sglang:decode_sum_seq_lens")),
         gen_progress,
         cpu_tokenizer,
         cpu_detokenizer,

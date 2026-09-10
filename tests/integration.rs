@@ -509,8 +509,8 @@ fn non_finite_gauge_values_read_as_no_data() {
 }
 
 // A NaN reading inside a windowed series must produce the same derived
-// shape as the series being absent altogether: same gauge lookup,
-// same pool membership, same graph lane.
+// shape as the series being absent altogether: same gauge lookup, same
+// pool membership.
 #[test]
 fn nan_reading_in_a_windowed_series_has_the_shape_of_a_missing_sample() {
     let t0 = Instant::now();
@@ -537,10 +537,6 @@ fn nan_reading_in_a_windowed_series_has_the_shape_of_a_missing_sample() {
         d_nan.pools.len(),
         d_missing.pools.len(),
         "pool membership must match the absent-series case"
-    );
-    assert_eq!(
-        d_nan.graphs.pool_mamba, d_missing.graphs.pool_mamba,
-        "pool graph lane must match the absent-series case"
     );
 }
 
@@ -1165,7 +1161,7 @@ fn busy_body(step: u32, decode: BusyDecode) -> String {
          # TYPE sglang:prefill_effective_tokens_total counter\n\
          sglang:prefill_effective_tokens_total{{mode=\"device_hit\"}} {}\n\
          sglang:prefill_effective_tokens_total{{mode=\"host_hit\"}} {}\n\
-         sglang:prefill_effective_tokens_total{{mode=\"miss\"}} {}\n\
+         sglang:prefill_effective_tokens_total{{mode=\"input\"}} {}\n\
          # TYPE sglang:process_cpu_seconds_total counter\n\
          sglang:process_cpu_seconds_total{{component=\"tokenizer\"}} {}\n\
          sglang:process_cpu_seconds_total{{component=\"detokenizer\"}} {}\n\
@@ -1270,24 +1266,6 @@ fn queue_reports_the_latest_scrape() {
     assert_eq!(d.queue, Some(2.0));
 }
 
-// Each subqueue reads its own gauge from the latest scrape.
-#[test]
-fn subqueue_gauges_read_the_latest_scrape() {
-    let d = busy_derived();
-    let expected = [
-        ("prefill bootstrap", 1.0),
-        ("prefill inflight", 2.0),
-        ("decode prealloc", 3.0),
-        ("decode transfer", 4.0),
-        ("grammar", 5.0),
-    ];
-    assert_eq!(d.subqueues.len(), expected.len());
-    for ((name, got), (want_name, want)) in d.subqueues.iter().zip(expected) {
-        assert_eq!(*name, want_name);
-        assert_eq!(*got, Some(want), "subqueue {name} was {got:?}");
-    }
-}
-
 // The three rate windows see different slices of a rate change: the 5s
 // window holds only the fast interval, the 15s and 60s windows average
 // the slow first half in. Deltas are 40 tokens/s for steps 1-5 and 80
@@ -1344,7 +1322,7 @@ fn pool_rows_carry_usage_counts_and_units() {
     assert_eq!(mamba.unit, "slots");
     let swa = find("SWA");
     assert_eq!(swa.usage, 0.25);
-    assert_eq!(swa.unit, "slots");
+    assert_eq!(swa.unit, "tokens");
     let host = find("host");
     assert_eq!(host.usage, 0.8);
     assert_eq!(host.used, Some(40000.0));
@@ -1352,20 +1330,325 @@ fn pool_rows_carry_usage_counts_and_units() {
     assert_eq!(host.unit, "tokens");
 }
 
-// The pool graph lanes recompute the ratios from raw counts, so a graph
-// tick can never disagree with the pool row above it.
+// The eviction lane replays the per-interval evicted-tokens rate under the rate lanes'
+// gap-aware pairing; the fixture advances its eviction counter 5 tokens per interval.
 #[test]
-fn pool_graph_lanes_match_the_pool_rows() {
+fn eviction_lane_replays_the_intervals() {
     let d = busy_derived();
-    assert_eq!(d.graphs.pool_kv, vec![0.8; 5]);
-    assert_eq!(d.graphs.pool_mamba, vec![0.2; 5]);
-    assert_eq!(d.graphs.pool_swa, vec![0.25; 5]);
-    assert_eq!(d.graphs.pool_host, vec![0.8; 5]);
+    assert_eq!(d.graphs.evictions.vals, vec![5.0; 5]);
+    assert_eq!(d.graphs.evictions.absent_old, vec![false; 5]);
+    assert_eq!(d.graphs.evictions.absent_new, vec![false; 5]);
+    assert_eq!(d.graphs.dt, vec![1.0; 5]);
+    // the headline eviction rate reads the same counter over the window
+    assert_eq!(d.evict_rate, Some(5.0));
+}
+
+// An eviction counter absent from one sample of a pair pairs nothing, like every other
+// counter: the touching intervals read 0 (no eviction tick) instead of fabricating a rate
+// across the gap, and a reappearance after the absence also pairs nothing.
+#[test]
+fn eviction_lane_pairs_nothing_across_an_absence() {
+    let with_evict = |v: f64| {
+        parse(&format!(
+            "# TYPE sglang:evicted_tokens_total counter\n\
+             sglang:evicted_tokens_total {v}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 2\n"
+        ))
+        .unwrap()
+    };
+    let without =
+        parse("# TYPE sglang:num_running_reqs gauge\nsglang:num_running_reqs 2\n").unwrap();
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, with_evict(0.0));
+    h.push(t0 + Duration::from_secs(1), with_evict(10.0));
+    h.push(t0 + Duration::from_secs(2), without);
+    h.push(t0 + Duration::from_secs(3), with_evict(30.0));
+    let d = derive(&h, 2).unwrap();
+    // interval 0 pairs 10 tokens/s; the intervals touching the absent
+    // sample and the reappearance after it all pair nothing
+    assert_eq!(d.graphs.evictions.vals, vec![10.0, 0.0, 0.0]);
+    assert_eq!(d.graphs.evictions.absent_old, vec![false, false, true]);
+    assert_eq!(d.graphs.evictions.absent_new, vec![false, true, false]);
+}
+
+// Per-position latency (TTFT family): each point is the histogram bucket delta
+// between the window's first sample and the position's later sample, so the newest point
+// is the window's headline quantile and earlier points cover a shorter growing span.
+// Hand-computed: position 1 sees 5 observations in (0, 0.5]: p50 rank 2.5 gives 0.25, p95
+// rank 4.75 gives 0.475. Position 2 adds 10 in (0.5, 2] and 20 in (2, 8]: p95
+// rank 23.75 gives 7.25. A per-interval delta reading of position 2 would give
+// 2.0 instead, since rank 10 of 10 in the (0.5, 2] bucket interpolates toward
+// its upper bound: this pin tells the two readings apart.
+#[test]
+fn latency_series_is_the_window_span_delta_per_position() {
+    let ttft = |cum: [f64; 4]| {
+        parse(&format!(
+            "# TYPE sglang:time_to_first_token_seconds histogram\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"0.5\"}} {}\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"2\"}} {}\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"8\"}} {}\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"+Inf\"}} {}\n\
+             sglang:time_to_first_token_seconds_count {}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 2\n",
+            cum[0], cum[1], cum[2], cum[3], cum[3]
+        ))
+        .unwrap()
+    };
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, ttft([0.0, 0.0, 0.0, 0.0]));
+    h.push(t0 + Duration::from_secs(1), ttft([5.0, 5.0, 5.0, 5.0]));
+    h.push(t0 + Duration::from_secs(2), ttft([5.0, 15.0, 25.0, 25.0]));
+    let d = derive(&h, 2).unwrap();
+    assert_eq!(d.graphs.ttft_p95, vec![Some(0.475), Some(7.25)]);
+}
+
+// A position whose span holds fewer observations than the quantile bar stores no latency:
+// the plot draws a gap there, never a zero or a stale point. The bar is the same
+// 5-observation minimum the headline quantile applies.
+#[test]
+fn latency_series_stores_no_quantile_when_the_span_is_sparse() {
+    let ttft = |cum: [f64; 2]| {
+        parse(&format!(
+            "# TYPE sglang:time_to_first_token_seconds histogram\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"0.5\"}} {}\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"+Inf\"}} {}\n\
+             sglang:time_to_first_token_seconds_count {}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 2\n",
+            cum[0], cum[1], cum[1]
+        ))
+        .unwrap()
+    };
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, ttft([0.0, 0.0]));
+    h.push(t0 + Duration::from_secs(1), ttft([2.0, 2.0]));
+    h.push(t0 + Duration::from_secs(2), ttft([4.0, 4.0]));
+    h.push(t0 + Duration::from_secs(3), ttft([6.0, 6.0]));
+    let d = derive(&h, 2).unwrap();
+    // positions 1 and 2 hold 2 and 4 observations, below the bar. Position 3's
+    // 6-observation span interpolates: p95 rank 5.7 lands on 0.475, compared
+    // with an epsilon because the rank itself carries binary float rounding
+    let p95 = d.graphs.ttft_p95[2].unwrap();
+    assert!((p95 - 0.475).abs() < 1e-9, "p95 was {p95}");
+}
+
+// The newest plot point is computed from the same span as the headline 60s quantile:
+// on a fixture with enough traffic the two agree. The real contract is the sparse
+// asymmetry in the second half: a window with too few observations makes the headline
+// fall back to the since-start snapshot while the plot point stays None, never
+// echoing the fallback.
+#[test]
+fn newest_plot_point_matches_the_headline_quantile() {
+    let d = busy_derived();
+    assert_eq!(d.graphs.ttft_p95.last().copied().flatten(), d.ttft[2].p95);
+
+    // sparse window: 2+2 observations across the whole window, below the bar
+    let ttft = |cum: [f64; 2]| {
+        parse(&format!(
+            "# TYPE sglang:time_to_first_token_seconds histogram\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"0.5\"}} {}\n\
+             sglang:time_to_first_token_seconds_bucket{{le=\"+Inf\"}} {}\n\
+             sglang:time_to_first_token_seconds_count {}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 2\n",
+            cum[0], cum[1], cum[1]
+        ))
+        .unwrap()
+    };
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, ttft([0.0, 0.0]));
+    h.push(t0 + Duration::from_secs(1), ttft([2.0, 2.0]));
+    h.push(t0 + Duration::from_secs(2), ttft([4.0, 4.0]));
+    let d = derive(&h, 2).unwrap();
+    // the headline echoes the since-start snapshot (4 obs <= 0.5: rank 3.8 -> 0.475)
+    let headline = d.ttft[2].p95.unwrap();
+    assert!((headline - 0.475).abs() < 1e-9, "headline was {headline}");
+    // the plot point stays None: no measured window span to interpolate
+    assert_eq!(d.graphs.ttft_p95.last().copied().flatten(), None);
+}
+
+// merge_le nets bucket deltas across label combinations, so a reset inside one
+// combination can hide against growth in another (-4 and +200 merge to +196).
+// The reset check therefore runs on the raw per-combination deltas,
+// before any merging: the plotted span stores a gap, never a quantile
+// of a broken span.
+#[test]
+fn a_reset_in_one_label_combination_gaps_the_window_span() {
+    let ttft = |a: f64, b: f64| {
+        parse(&format!(
+            "# TYPE sglang:time_to_first_token_seconds histogram\n\
+             sglang:time_to_first_token_seconds_bucket{{name=\"a\",le=\"0.5\"}} {a}\n\
+             sglang:time_to_first_token_seconds_bucket{{name=\"a\",le=\"+Inf\"}} {a}\n\
+             sglang:time_to_first_token_seconds_count{{name=\"a\"}} {a}\n\
+             sglang:time_to_first_token_seconds_bucket{{name=\"b\",le=\"0.5\"}} {b}\n\
+             sglang:time_to_first_token_seconds_bucket{{name=\"b\",le=\"+Inf\"}} {b}\n\
+             sglang:time_to_first_token_seconds_count{{name=\"b\"}} {b}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 2\n"
+        ))
+        .unwrap()
+    };
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, ttft(4.0, 0.0));
+    h.push(t0 + Duration::from_secs(1), ttft(0.0, 200.0));
+    let d = derive(&h, 2).unwrap();
+    // combination a lost its 4 observations while b grew by 200: the merged
+    // ladder reads +196 and would interpolate a p95 from a span that mixes
+    // a reset with growth
+    assert_eq!(d.graphs.ttft_p95.last(), Some(&None));
+}
+
+// The cache hit fraction comes from the effective-prefill counter's windowed
+// rates (hit modes 60+30 over all modes 100 = 0.9) while that family exists.
+// The engine's cache_hit_rate gauge (0.73 in the fixture) is the fallback
+// path for exporters without the counter.
+// An alarm channel latches the first time its per-interval rate reads
+// nonzero and stays latched: a later quiet interval never clears it.
+#[test]
+fn alarm_latches_flip_on_first_nonzero_interval_and_stay_latched() {
+    let with_retract = |v: f64| {
+        format!(
+            "# TYPE sglang:num_retracted_reqs counter\n\
+             sglang:num_retracted_reqs {v}\n\
+             # TYPE sglang:num_running_reqs gauge\n\
+             sglang:num_running_reqs 2\n"
+        )
+    };
+    let mut a = sgtop::derive::Alarms::default();
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, parse(&with_retract(0.0)).unwrap());
+    h.push(
+        t0 + Duration::from_secs(1),
+        parse(&with_retract(5.0)).unwrap(),
+    );
+    sgtop::derive::update_alarms(&mut a, &h);
+    assert!(a.retraction, "first nonzero retraction interval must latch");
+    h.push(
+        t0 + Duration::from_secs(2),
+        parse(&with_retract(5.0)).unwrap(),
+    );
+    sgtop::derive::update_alarms(&mut a, &h);
+    assert!(
+        a.retraction,
+        "session-sticky: a quiet interval never clears it"
+    );
+}
+
+// The latches are session-sticky per engine session: the same counter reset
+// evidence that clears the session peaks clears them, so a restarted engine
+// does not inherit the previous process's fired alarms.
+#[test]
+fn alarm_latches_clear_on_the_engine_restart_evidence() {
+    let with_retract = |retract: f64, decode: f64| {
+        format!(
+            "# TYPE sglang:num_retracted_reqs counter\n\
+             sglang:num_retracted_reqs {retract}\n\
+             # TYPE sglang:realtime_tokens_total counter\n\
+             sglang:realtime_tokens_total{{mode=\"decode\"}} {decode}\n"
+        )
+    };
+    let mut a = sgtop::derive::Alarms::default();
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, parse(&with_retract(0.0, 100.0)).unwrap());
+    h.push(
+        t0 + Duration::from_secs(1),
+        parse(&with_retract(5.0, 160.0)).unwrap(),
+    );
+    sgtop::derive::update_alarms(&mut a, &h);
+    assert!(a.retraction, "the latch must fire before the restart");
+    // the token counter drops: the engine restarted, so the fired alarm
+    // belongs to the previous process
+    h.push(
+        t0 + Duration::from_secs(2),
+        parse(&with_retract(5.0, 50.0)).unwrap(),
+    );
+    sgtop::derive::update_alarms(&mut a, &h);
+    assert!(
+        !a.retraction && !a.http_503 && !a.l2_drop,
+        "restart evidence must clear the old session's latches"
+    );
+}
+
+// Fixture integrity: every body line is exposition-format data. A `//`
+// inside the format literal is string content, not a comment, and once
+// spliced in it silently swallows the neighboring metric header.
+#[test]
+fn busy_body_contains_no_stray_comment_lines() {
+    for step in 0..3 {
+        for decode in [
+            BusyDecode::Normal,
+            BusyDecode::Absent,
+            BusyDecode::NonFinite,
+        ] {
+            assert!(
+                !busy_body(step, decode).contains("//"),
+                "fixture body carries a comment line (string-literal splice)"
+            );
+        }
+    }
+}
+
+// The cache-miss lane draws absence and measured zero differently:
+// when the `input` counter family is missing from an interval's
+// endpoint samples the point is a gap (None), while a present counter
+// with no delta is a zero bar.
+#[test]
+fn cache_miss_lane_gaps_when_the_counter_family_is_absent() {
+    let miss = "# TYPE sglang:prefill_effective_tokens_total counter\n\
+        sglang:prefill_effective_tokens_total{mode=\"input\"} {v}\n";
+    let quiet = "# TYPE sglang:num_running_reqs gauge\n\
+        sglang:num_running_reqs 1\n";
+    let mut h = History::default();
+    let t0 = Instant::now();
+    // family present with no delta between the two samples: a measured zero
+    h.push(t0, parse(&miss.replace("{v}", "10")).unwrap());
+    h.push(
+        t0 + Duration::from_secs(1),
+        parse(&miss.replace("{v}", "10")).unwrap(),
+    );
+    let g = h.scan().unwrap();
+    assert_eq!(g.cache_misses, vec![Some(0.0)]);
+    // the family vanishes from the later sample: absence, not a zero bar
+    h.push(t0 + Duration::from_secs(2), parse(quiet).unwrap());
+    let g = h.scan().unwrap();
+    assert_eq!(g.cache_misses, vec![Some(0.0), None]);
 }
 
 #[test]
-fn cache_hit_rate_reads_the_latest_gauge() {
-    assert_eq!(busy_derived().cache_hit, Some(0.73));
+fn cache_hit_rate_comes_from_the_effective_tokens_rates() {
+    let d = busy_derived();
+    assert_eq!(d.cache_hit, Some(0.9));
+    assert_eq!(d.cache_cached, Some(90.0));
+    assert_eq!(d.cache_computed, Some(10.0));
+    // the miss lane replays the per-interval computed rate
+    assert_eq!(d.graphs.cache_misses, vec![Some(10.0); 5]);
+}
+
+// Without the effective-tokens counter family the hit fraction falls back
+// to the engine's cache_hit_rate gauge.
+#[test]
+fn cache_hit_rate_falls_back_to_the_engine_gauge() {
+    let body = "# TYPE sglang:cache_hit_rate gauge\n\
+                sglang:cache_hit_rate 0.73\n\
+                # TYPE sglang:num_running_reqs gauge\n\
+                sglang:num_running_reqs 2\n";
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, parse(body).unwrap());
+    h.push(t0 + Duration::from_secs(1), parse(body).unwrap());
+    let d = derive(&h, 2).unwrap();
+    assert_eq!(d.cache_hit, Some(0.73));
+    assert_eq!(d.cache_cached, None);
+    assert_eq!(d.cache_computed, None);
 }
 
 #[test]
@@ -1513,16 +1796,6 @@ fn http_503_rate_isolates_the_503_series() {
     assert_eq!(busy_derived().http_503_rate, Some(2.0));
 }
 
-#[test]
-fn http_active_reads_the_latest_gauge() {
-    assert_eq!(busy_derived().http_active, Some(3.0));
-}
-
-#[test]
-fn gen_throughput_gauge_reads_the_latest_gauge() {
-    assert_eq!(busy_derived().gen_throughput_gauge, Some(123.4));
-}
-
 // Device and host hit rates split their own modes against the whole
 // family's total: 60 + 30 + 10 tokens/s, so device reads 0.6
 // and host reads 0.3.
@@ -1544,9 +1817,11 @@ fn l2_traffic_rates_report_backup_load_and_drop() {
     assert_eq!(d.l2_drop, Some(0.0));
 }
 
+// The aggregate generation row reads the decode sequence-length sum
+// directly: 40 generated tokens across the 4 running requests.
 #[test]
-fn new_token_ratio_reads_the_latest_gauge() {
-    assert_eq!(busy_derived().new_token_ratio, Some(0.35));
+fn gen_total_reads_the_running_requests_sum() {
+    assert_eq!(busy_derived().gen_total, Some(40.0));
 }
 
 // Average generation length divides the running requests' total

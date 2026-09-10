@@ -188,7 +188,11 @@ pub fn draw(f: &mut Frame, ui: &Ui, shared: &Arc<Shared>) {
 
     let mut constraints: Vec<Constraint> = vec![
         Constraint::Length(1),
-        Constraint::Length(if compact { 3 } else { 5 }),
+        // the full hero needs four content rows: the token/s cell alone carries three
+        // (prefill rate, decode rate, prompt-size context)
+        // hero grows one row: the pools cell stacks one line per pool plus
+        // the occupancy gloss under the label
+        Constraint::Length(if compact { 3 } else { 7 }),
     ];
     let mut graph_i: Option<usize> = None;
     if ui.graphs_on {
@@ -207,7 +211,13 @@ pub fn draw(f: &mut Frame, ui: &Ui, shared: &Arc<Shared>) {
     } else {
         // detail sizes to its content (capped); all spare rows go to the
         // graphs row above, which is the only Min and absorbs the rest
-        Constraint::Length(detail_height(d.as_ref(), ui.window_focus))
+        let alarms = *shared.alarms.lock().unwrap();
+        Constraint::Length(detail_height(
+            d.as_ref(),
+            ui.window_focus,
+            &alarms,
+            &shared.peaks.lock().unwrap(),
+        ))
     });
 
     let chunks = Layout::vertical(constraints).split(f.area());
@@ -225,15 +235,7 @@ pub fn draw(f: &mut Frame, ui: &Ui, shared: &Arc<Shared>) {
         }
     }
     draw_latency(f, ui, t, chunks[lat_i], d.as_ref(), compact);
-    draw_detail(
-        f,
-        ui,
-        t,
-        chunks[det_i],
-        d.as_ref(),
-        compact,
-        &shared.peaks.lock().unwrap(),
-    );
+    draw_detail(f, ui, t, chunks[det_i], d.as_ref(), compact, shared);
 
     match ui.overlay {
         Overlay::None => {}
@@ -342,14 +344,16 @@ fn draw_hero(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect, d: Option<&Derived>,
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // WORDS OUT gets double width so decode and prefill both fit in full
+    // the token/s cell keeps double width (its rate lines); time-to-first-
+    // token is sized to its long label, and the memory-pools cell fits
+    // the stacked per-pool readings, the longest pool line being 18 columns
     let cols = Layout::horizontal([
-        Constraint::Ratio(1, 7),
-        Constraint::Ratio(1, 7),
-        Constraint::Ratio(2, 7),
-        Constraint::Ratio(1, 7),
-        Constraint::Ratio(1, 7),
-        Constraint::Ratio(1, 7),
+        Constraint::Percentage(12),
+        Constraint::Percentage(12),
+        Constraint::Percentage(27),
+        Constraint::Percentage(18),
+        Constraint::Percentage(12),
+        Constraint::Percentage(19),
     ])
     .split(inner);
 
@@ -387,35 +391,22 @@ fn draw_hero(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect, d: Option<&Derived>,
                 Span::styled(format!("  ·  {}", triple(win)), Style::new().fg(t.dim)),
             ])
         };
-        cells.push((
-            "WORDS OUT".into(),
-            vec![
-                rate_line("prefill", d.prefill_instant, &d.prefill_rate, t.s2),
-                rate_line("decode", d.decode_instant, &d.decode_rate, t.s1),
-            ],
-        ));
-        // host tier is excluded from the alarm: it idles near 100% by design (LRU-recycled write-through cache); only KV/mamba fullness blocks requests
-        let worst = d
-            .pools
-            .iter()
-            .filter(|p| p.name != "host")
-            .map(|p| p.usage)
-            .fold(0.0_f64, f64::max);
-        cells.push(kv(
-            "MEMORY POOLS",
-            &fmt_pct(Some(worst)),
-            &d.pools
-                .iter()
-                .map(|p| format!("{} {}", p.name, pool_value(p)))
-                .collect::<Vec<_>>()
-                .join(" · "),
-            Style::new()
-                .fg(usage_color(t, worst))
-                .add_modifier(Modifier::BOLD),
-        ));
+        let mut rates = vec![
+            rate_line("prefill", d.prefill_instant, &d.prefill_rate, t.s2),
+            rate_line("decode", d.decode_instant, &d.decode_rate, t.s1),
+        ];
+        // prompt-size context, the same pair gloss the latency row subtitle
+        // carries: prompt sizes as submitted plus the cache misses' sizes
+        if let Some(gloss) = prompt_computed_gloss(d) {
+            rates.push(Line::from(Span::styled(
+                format!(" {gloss}"),
+                Style::new().fg(t.dim),
+            )));
+        }
+        cells.push(("TOKEN/s".into(), rates));
         let ttft = d.ttft[focus].p95;
         cells.push(kv(
-            "FIRST WORD",
+            "TIME TO FIRST TOKEN",
             &fmt_secs(ttft),
             "p95 · first token",
             Style::new()
@@ -438,6 +429,31 @@ fn draw_hero(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect, d: Option<&Derived>,
             &format!("{:.1}s frozen in {}", s.seconds, WIN_LABELS[focus]),
             stall_style,
         ));
+        // one pool per line: the joined single line truncates at live
+        // widths. Each pool line shows the absolute reading, fullness
+        // colored. The host tier stays out of the cell: it idles
+        // near 100% by design (an LRU write-through cache), entries
+        // recycled in place: a stacked host line would look like an alarm
+        // the engine never actually raises
+        let mut pool_lines: Vec<Line<'static>> = d
+            .pools
+            .iter()
+            .filter(|p| p.name != "host")
+            .map(|p| {
+                let style = Style::new()
+                    .fg(usage_color(t, p.usage))
+                    .add_modifier(Modifier::BOLD);
+                match pool_value(p) {
+                    Some(v) => Line::from(Span::styled(format!(" {} {v}", p.name), style)),
+                    None => Line::from(Span::styled(format!(" {}", p.name), style)),
+                }
+            })
+            .collect();
+        pool_lines.push(Line::from(Span::styled(
+            " full = requests queue",
+            Style::new().fg(t.dim),
+        )));
+        cells.push(("MEMORY POOLS".into(), pool_lines));
     }
 
     for (i, cell) in cells.iter().enumerate() {
@@ -483,15 +499,10 @@ fn draw_graphs_row(
     d: &Derived,
     peaks: &crate::derive::Peaks,
 ) {
-    let cols = Layout::horizontal([
-        Constraint::Percentage(29),
-        Constraint::Percentage(29),
-        Constraint::Percentage(42),
-    ])
-    .split(area);
+    let cols =
+        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
     draw_rate_graph(f, t, cols[0], d, RateGraph::Prefill, peaks);
     draw_rate_graph(f, t, cols[1], d, RateGraph::Decode, peaks);
-    draw_right_graphs(f, t, cols[2], d, peaks);
 }
 
 /// Which rate series a standalone graph shows.
@@ -500,21 +511,41 @@ pub enum RateGraph {
     Decode,
 }
 
-/// Calibration gridlines for an observed peak: every multiple of the
-/// round step up to and including the first one above the peak, with the
-/// scale topped 10% above the highest gridline.
+/// Calibration gridlines for an observed peak, at any magnitude: one line
+/// per round step (1, 0.1, 0.01, ... below 1), the last step above the peak,
+/// scale topped 10% higher. The lowest line carries the axis unit
+/// (ms-scale latencies label 0.4s, rates label 10k tok/s).
 fn grid_for_scale(scale: f64, t: &Theme) -> (Vec<(f64, ratatui::style::Color)>, f64) {
-    if scale >= 10.0 {
+    if scale > 0.0 {
         let step = 10.0_f64.powf(scale.log10().floor());
         let top_line = (scale / step).ceil() * step;
         let lines: Vec<(f64, ratatui::style::Color)> = (1..=(top_line / step) as i64)
             .map(|m| (m as f64 * step, t.dim))
             .collect();
-        let ymax = (top_line * 1.1).max(scale * 1.15).max(10.0);
-        (lines, ymax)
+        (lines, top_line * 1.1)
     } else {
-        (Vec::new(), (scale * 1.15).max(10.0))
+        (Vec::new(), 1.0)
     }
+}
+
+/// Bottom-axis tick marks for one graph: a red tick on every stalled
+/// interval and, where `evict` is given, an orange tick in the paired color
+/// marking intervals whose eviction rate advanced. Both ticks on one
+/// interval render as the stall (stalls are the emergency).
+#[derive(Clone, Copy)]
+struct Ticks<'a> {
+    stall: &'a [bool],
+    evict: Option<(&'a [f64], ratatui::style::Color)>,
+}
+
+/// Dress a mini graph wears besides its fill: the axis unit on the lowest
+/// gridline label, the stall/eviction ticks, an optional overlay series
+/// drawn as a line over the fill, and the calibration gridlines.
+struct PlotDress<'a> {
+    unit: &'a str,
+    ticks: Option<Ticks<'a>>,
+    overlay: Option<(&'a [Option<f64>], ratatui::style::Color)>,
+    ref_lines: &'a [(f64, ratatui::style::Color)],
 }
 
 fn draw_rate_graph(
@@ -526,7 +557,7 @@ fn draw_rate_graph(
     peaks: &crate::derive::Peaks,
 ) {
     let g = &d.graphs;
-    let (vals, instant, color, title, gloss, sub, with_stalls) = match which {
+    let (vals_src, instant, color, title, gloss, sub) = match which {
         RateGraph::Prefill => (
             &g.prefill.vals,
             d.prefill_instant,
@@ -537,7 +568,6 @@ fn draw_rate_graph(
                 " bursts freeze streams ".to_string(),
                 Style::new().fg(t.dim),
             ))),
-            false,
         ),
         RateGraph::Decode => (
             &g.decode.vals,
@@ -545,16 +575,25 @@ fn draw_rate_graph(
             t.s1,
             "Decode",
             "token generation",
-            Some(Line::from(Span::styled(
-                " red ticks are stalls ".to_string(),
-                Style::new().fg(t.dim),
-            ))),
-            true,
+            // legend words carry their lines' colors: the aggregate fill
+            // renders in s1 and the single-stream line in accent
+            Some(Line::from(vec![
+                Span::styled(
+                    " aggregate ",
+                    Style::new().fg(t.s1).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("\u{b7} ", Style::new().fg(t.dim)),
+                Span::styled(
+                    "single-stream ",
+                    Style::new().fg(t.s3).add_modifier(Modifier::BOLD),
+                ),
+            ])),
         ),
     };
+    let vals: Vec<Option<f64>> = vals_src.iter().map(|v| Some(*v)).collect();
     // scale is the larger of the in-window max and the session peak;
     // grid_for_scale adds headroom above the top gridline
-    let vmax = vals.iter().cloned().fold(0.0_f64, f64::max);
+    let vmax = vals.iter().filter_map(|v| *v).fold(0.0_f64, f64::max);
     let peak = match which {
         RateGraph::Prefill => peaks.prefill,
         RateGraph::Decode => peaks.decode,
@@ -569,7 +608,11 @@ fn draw_rate_graph(
         Span::styled(format!("({gloss}) "), Style::new().fg(t.dim)),
         Span::styled(
             format!(
-                "\u{2014} now {:.0} · peak {:.0} ",
+                "\u{2014} {} {:.0} \u{b7} peak {:.0} ",
+                match which {
+                    RateGraph::Prefill => "now",
+                    RateGraph::Decode => "aggregate now",
+                },
                 instant.unwrap_or(0.0),
                 scale
             ),
@@ -580,182 +623,171 @@ fn draw_rate_graph(
             Style::new().fg(color).add_modifier(Modifier::BOLD),
         ),
     ]);
+    // the decode legend line gains the window's per-stream stats:
+    // mean and max of the single-stream series join the legend
+    // on the bottom border, keeping the top title short on laptops
+    let sub = match which {
+        RateGraph::Prefill => sub,
+        RateGraph::Decode => {
+            let (sum, peak, n) = g
+                .per_stream
+                .iter()
+                .filter_map(|v| *v)
+                .fold((0.0_f64, 0.0_f64, 0_usize), |(s, p, n), v| {
+                    (s + v, p.max(v), n + 1)
+                });
+            let mut spans = match sub {
+                Some(line) => line.spans,
+                None => Vec::new(),
+            };
+            if n > 0 {
+                spans.push(Span::styled(
+                    format!(" \u{b7} avg {:.0} \u{b7} peak {:.0} ", sum / n as f64, peak),
+                    Style::new().fg(t.s3).add_modifier(Modifier::BOLD),
+                ));
+            }
+            Some(Line::from(spans))
+        }
+    };
     let block = block_titled(t, title, sub);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // the decode canvas carries a second line for the per-stream speed
+    // (decode rate divided by running requests); aggregate is at minimum
+    // the single-stream rate, so the two share a scale
+    let (ticks, overlay) = match which {
+        RateGraph::Prefill => (None, None),
+        RateGraph::Decode => (
+            Some(Ticks {
+                stall: &g.stall,
+                evict: None,
+            }),
+            Some((g.per_stream.as_slice(), t.s3)),
+        ),
+    };
+    mini_line_graph(
+        f,
+        inner,
+        &vals,
+        &g.dt,
+        ymax,
+        color,
+        PlotDress {
+            unit: " tok/s",
+            ticks,
+            overlay,
+            ref_lines: &ref_lines,
+        },
+    );
+}
+
+/// TTFT plot (left of the latency row's two plots): the p95 series shaded,
+/// in seconds. The table's row subtitle repeats the pair gloss.
+fn draw_ttft_plot(f: &mut Frame, t: &Theme, area: Rect, d: &Derived) {
+    let g = &d.graphs;
+    let ticks = Ticks {
+        stall: &g.stall,
+        evict: Some((&g.evictions.vals, t.warn)),
+    };
+    let scale = g.ttft_p95.iter().filter_map(|v| *v).fold(0.0_f64, f64::max);
+    let (ref_lines, ymax) = grid_for_scale(scale, t);
+    // latency is a lower-is-better metric, so the fill color follows
+    // the latest p95: green only while genuinely good, amber or red
+    // as it worsens; a static green fill reads as healthy
+    // at any magnitude, which is exactly wrong
+    let p95_now = d.ttft[2].p95;
+    let lat_color = latency_color(t, p95_now, &d.ttft[2]);
+    let title = Line::from(vec![
+        Span::styled(" TTFT ", Style::new().fg(t.fg).add_modifier(Modifier::BOLD)),
+        // legend: the p95 series (the only series plotted)
+        Span::styled(
+            "\u{25cf} ",
+            Style::new().fg(lat_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("p95", Style::new().fg(t.dim)),
+    ]);
+    // the subtitle carries the prompt half of the size gloss: the cache-miss
+    // plot carries the computed half, the table's subtitle holds the full pair
+    let sub = prompt_size_span(d)
+        .map(|gloss| Line::from(Span::styled(format!(" {gloss} "), Style::new().fg(t.dim))));
+    let block = block_titled(t, title, sub);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    mini_line_graph(
+        f,
+        inner,
+        &g.ttft_p95,
+        &g.dt,
+        ymax,
+        lat_color,
+        PlotDress {
+            unit: "s",
+            ticks: Some(ticks),
+            overlay: None,
+            ref_lines: &ref_lines,
+        },
+    );
+}
+
+/// Cache-misses plot (right of the latency row's two plots): computed prompt
+/// tokens/s per interval, on a tok/s scale with the same stall/eviction ticks.
+/// These are the prefix-cache misses, the prompt work the device chewed raw.
+fn draw_cache_miss_plot(f: &mut Frame, t: &Theme, area: Rect, d: &Derived) {
+    let g = &d.graphs;
+    let ticks = Ticks {
+        stall: &g.stall,
+        evict: Some((&g.evictions.vals, t.warn)),
+    };
+    let vals = &g.cache_misses;
+    let vmax = vals.iter().filter_map(|v| *v).fold(0.0_f64, f64::max);
+    let (ref_lines, ymax) = grid_for_scale(vmax, t);
+    let title = Line::from(vec![
+        Span::styled(
+            " Cache misses ",
+            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "\u{25cf}",
+            Style::new().fg(t.s2).add_modifier(Modifier::BOLD),
+        ),
+    ]);
+    let sub = computed_size_span(d)
+        .map(|gloss| Line::from(Span::styled(format!(" {gloss} "), Style::new().fg(t.dim))));
+    let block = block_titled(t, title, sub);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
     mini_line_graph(
         f,
         inner,
         vals,
         &g.dt,
         ymax,
-        color,
-        with_stalls.then_some(&g.stall),
-        crate::derive::WINDOWS[2].as_secs_f64(),
-        &ref_lines,
+        t.s2,
+        PlotDress {
+            unit: " tok/s",
+            ticks: Some(ticks),
+            overlay: None,
+            ref_lines: &ref_lines,
+        },
     );
 }
 
-fn draw_right_graphs(
-    f: &mut Frame,
-    t: &Theme,
-    area: Rect,
-    d: &Derived,
-    peaks: &crate::derive::Peaks,
-) {
-    let rows =
-        Layout::vertical([Constraint::Percentage(52), Constraint::Percentage(48)]).split(area);
-
-    let g = &d.graphs;
-
-    // pools history: one lane (own canvas) per active pool
-    let pool_colors = [t.s1, t.warn, t.accent, t.s2];
-    let mut title_spans = vec![Span::styled(
-        " Memory pools",
-        Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
-    )];
-    for (i, p) in d.pools.iter().enumerate() {
-        title_spans.push(Span::styled(" \u{b7} ", Style::new().fg(t.dim)));
-        title_spans.push(Span::styled(
-            format!("{} {}", p.name, pool_value(p)),
-            Style::new()
-                .fg(pool_colors[i % pool_colors.len()])
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-    title_spans.push(Span::styled(" ", Style::new().fg(t.fg)));
-    let pblock = block_titled(
-        t,
-        Line::from(title_spans),
-        Some(Line::from(Span::styled(
-            " KV/mamba full = requests wait · host full is normal (it recycles its own old entries) ".to_string(),
-            Style::new().fg(t.dim),
-        ))),
-    );
-    let lane_area = pblock.inner(rows[0]);
-    f.render_widget(pblock, rows[0]);
-    // never more lanes than the area has rows (each lane needs a graph
-    // row plus its axis row), or the axis lines of zero-height lanes
-    // would smear onto the block border
-    let n = d
-        .pools
-        .len()
-        .clamp(1, (lane_area.height as usize / 2).max(1));
-    let lanes = Layout::vertical(vec![Constraint::Ratio(1, n as u32); n])
-        .spacing(1)
-        .split(lane_area);
-    for (i, p) in d.pools.iter().take(n).enumerate() {
-        let series: &[f64] = match p.name {
-            "KV" => &g.pool_kv,
-            "mamba" => &g.pool_mamba,
-            "host" => &g.pool_host,
-            "SWA" => &g.pool_swa,
-            _ => continue,
-        };
-        let color = pool_colors[i % pool_colors.len()];
-        // the axis underline gets its own row; the graph keeps the rows above it
-        let lane = lanes[i];
-        let graph_rect = Rect {
-            height: lane.height.saturating_sub(1),
-            ..lane
-        };
-        mini_line_graph(
-            f,
-            graph_rect,
-            series,
-            &g.dt,
-            1.05,
-            color,
-            None,
-            crate::derive::WINDOWS[2].as_secs_f64(),
-            &[],
-        );
-        // labeled zero-axis underline: each lane is its own 0-100% scale
-        let w = lanes[i].width as usize;
-        let axis = Line::from(vec![
-            Span::styled(
-                format!(" {} ", p.name),
-                Style::new().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            // exactly fill the lane width, or the graph's right-edge
-            // column peeks out past the underline
-            Span::styled(
-                "\u{2500}".repeat(w.saturating_sub(p.name.chars().count() + 2)),
-                Style::new().fg(color),
-            ),
-        ]);
-        if lanes[i].height >= 1 {
-            let axis_rect = Rect {
-                x: lanes[i].x,
-                y: lanes[i].y + lanes[i].height - 1,
-                width: lanes[i].width,
-                height: 1,
-            };
-            f.render_widget(Paragraph::new(axis), axis_rect);
-        }
-    }
-
-    // speed per stream: total decode rate divided by running requests (inverse of ITL)
-    let smax_view = g
-        .per_stream
-        .iter()
-        .filter_map(|v| *v)
-        .fold(0.0_f64, f64::max);
-    let sscale = smax_view.max(peaks.decode_single.unwrap_or(0.0));
-    let (sgrid, smax) = grid_for_scale(sscale, t);
-    let title = format!(
-        "Speed per stream — now {} · peak {}",
-        g.per_stream
-            .last()
-            .copied()
-            .flatten()
-            .map(|v| format!("{v:.0} tok/s"))
-            .unwrap_or_else(|| "idle".into()),
-        peaks
-            .decode_single
-            .map(|v| format!("{v:.0}"))
-            .unwrap_or_else(|| "\u{2014}".into())
-    );
-    let iblock = block_titled(
-        t,
-        Line::from(Span::styled(
-            format!(" {title} "),
-            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
-        )),
-        Some(Line::from(Span::styled(
-            " how fast each answer is being written — dips are stalls ".to_string(),
-            Style::new().fg(t.dim),
-        ))),
-    );
-    let inner = iblock.inner(rows[1]);
-    f.render_widget(iblock, rows[1]);
-    let vals: Vec<f64> = g.per_stream.iter().map(|v| v.unwrap_or(0.0)).collect();
-    mini_line_graph(
-        f,
-        inner,
-        &vals,
-        &g.dt,
-        smax,
-        t.warn,
-        None,
-        crate::derive::WINDOWS[2].as_secs_f64(),
-        &sgrid,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
 fn mini_line_graph(
     f: &mut Frame,
     area: Rect,
-    vals: &[f64],
+    vals: &[Option<f64>],
     dt: &[f64],
     ymax: f64,
     color: ratatui::style::Color,
-    stall: Option<&[bool]>,
-    window_secs: f64,
-    ref_lines: &[(f64, ratatui::style::Color)],
+    dress: PlotDress<'_>,
 ) {
+    // every graph in the app spans the same trailing window
+    let window_secs = crate::derive::WINDOWS[2].as_secs_f64();
+    let unit = dress.unit;
+    let ticks = dress.ticks;
+    let overlay = dress.overlay;
+    let ref_lines = dress.ref_lines;
     if dt.is_empty() || ymax <= 0.0 || window_secs <= 0.0 || area.width == 0 || area.height == 0 {
         return;
     }
@@ -771,53 +803,120 @@ fn mini_line_graph(
         ((w_dots - 1.0) - (span - cum) / window_secs * (w_dots - 1.0)).clamp(0.0, w_dots - 1.0)
     };
     // each sample holds for its whole scrape interval; fill columns
-    // interpolate between interval ends to form a solid histogram
-    let mut cols: Vec<(f64, f64)> = Vec::new();
-    let mut tops: Vec<(f64, f64)> = Vec::new();
-    let mut ticks: Vec<(f64, f64)> = Vec::new();
+    // interpolate between interval ends to form a solid histogram. An absent value
+    // (no measured data at that position) breaks the fill, so the gap is drawn, never bridged.
+    let mut tops: Vec<(usize, f64, f64)> = Vec::new();
+    let mut tick_dots: Vec<(f64, ratatui::style::Color)> = Vec::new();
     let mut x = 0.0;
-    for (i, &v) in vals.iter().enumerate() {
+    for (i, v) in vals.iter().enumerate() {
         let cx = axis_x(x);
-        let h = ((v / ymax) * h_dots * 0.96).min(h_dots * 0.96);
-        tops.push((cx, h));
-        if stall.is_some_and(|s| s.get(i).copied().unwrap_or(false)) {
-            ticks.push((cx, 0.0));
+        if let Some(v) = v {
+            let h = ((v / ymax) * h_dots * 0.96).min(h_dots * 0.96);
+            tops.push((i, cx, h));
+        }
+        let stalled = ticks.is_some_and(|t| t.stall.get(i).copied().unwrap_or(false));
+        if stalled {
+            tick_dots.push((cx, ratatui::style::Color::Red));
+        } else if let Some((rates, color)) = ticks.and_then(|t| t.evict) {
+            // the eviction tick rides the pair's color; a zero rate draws
+            // nothing
+            if rates.get(i).is_some_and(|&rate| rate > 0.0) {
+                tick_dots.push((cx, color));
+            }
         }
         x += dt.get(i).copied().unwrap_or(1.0);
     }
+    let mut cols: Vec<(f64, f64)> = Vec::new();
     for w in tops.windows(2) {
-        let (x0, h0) = w[0];
-        let (x1, h1) = w[1];
+        let (i0, x0, h0) = w[0];
+        let (i1, x1, h1) = w[1];
+        if i1 != i0 + 1 {
+            continue;
+        }
         let mut cx = x0;
         while cx < x1 {
-            let t = (cx - x0) / (x1 - x0).max(1.0);
-            let h = h0 + (h1 - h0) * t;
+            let frac = (cx - x0) / (x1 - x0).max(1.0);
+            let h = h0 + (h1 - h0) * frac;
             cols.push((cx, h.max(1.0)));
             cx += 1.0;
         }
     }
     // the newest bin is still in progress: hold its value out to the
-    // right edge so the graph always touches the present moment
-    if let Some((_, h)) = tops.last() {
-        let h = h.max(1.0);
-        let start = tops.last().unwrap().0;
-        for cx in start as i64..=(w_dots as i64 - 1) {
-            cols.push((cx as f64, h));
+    // right edge so the graph always touches the present moment, but only
+    // when the newest position itself has data
+    if let Some(&(i, start, h)) = tops.last() {
+        if i + 1 == vals.len() {
+            let h = h.max(1.0);
+            for cx in start as i64..=(w_dots as i64 - 1) {
+                cols.push((cx as f64, h));
+            }
         }
     }
-    // dashed gridlines at each multiple of the step with faded labels;
-    // the lowest line carries the unit, the rest are bare numbers
+    // the overlay line (single-stream speed, p50) connects its own measured
+    // points and, like the fill, breaks where a position has no measured
+    // value. Paint order here is load bearing: braille cells keep the last
+    // shape drawn, so the overlay must come after the fill or the aggregate
+    // erases it where the two coincide
+    let mut overlay_tops: Vec<(usize, f64, f64)> = Vec::new();
+    let mut overlay_color = color;
+    if let Some((series, ocolor)) = overlay {
+        overlay_color = ocolor;
+        let mut x = 0.0;
+        for (i, v) in series.iter().enumerate() {
+            if let Some(v) = v {
+                let h = ((v / ymax) * h_dots * 0.96).min(h_dots * 0.96);
+                overlay_tops.push((i, axis_x(x), h));
+            }
+            x += dt.get(i).copied().unwrap_or(1.0);
+        }
+    }
+    // dashed gridlines at each step multiple with faded labels; the lowest
+    // line carries the unit, the rest are bare numbers. A label lands in one
+    // of canvas_rows - 1 distinct slots (the canvas maps label floats that way),
+    // so gridlines one step apart can share a slot when the canvas is short.
+    // Keep the lowest label per slot and drop the rest, or a later label
+    // punches through an earlier one and leaves stray characters behind.
     let grid: Vec<(f64, f64)> = ref_lines
         .iter()
         .map(|(v, _)| (*v, (*v / ymax * h_dots * 0.96).clamp(1.0, h_dots - 2.0)))
         .collect();
+    let canvas_rows = (h_dots / 4.0) as usize;
+    let slot_of = |y: f64| (((h_dots - y) * (canvas_rows.max(2) - 1) as f64) / h_dots) as usize;
+    let lowest = grid.first().map(|(v, _)| *v);
+    let mut labels: Vec<(f64, String)> = Vec::new();
+    let mut used_slot: Option<usize> = None;
+    for (v, ry) in &grid {
+        let y = ry + 2.0;
+        let slot = slot_of(y);
+        if used_slot == Some(slot) {
+            continue;
+        }
+        used_slot = Some(slot);
+        let n = if *v >= 1.0e6 {
+            format!("{:.0}M", v / 1.0e6)
+        } else if *v >= 1.0e3 {
+            format!("{:.0}k", v / 1.0e3)
+        } else if *v < 0.1 {
+            format!("{v:.2}")
+        } else if *v < 1.0 {
+            format!("{v:.1}")
+        } else {
+            format!("{v:.0}")
+        };
+        let text = if Some(*v) == lowest {
+            format!("{n}{unit}")
+        } else {
+            n
+        };
+        labels.push((y, text));
+    }
     let label_style = ref_lines.first().map(|(_, c)| *c);
     let canvas = Canvas::default()
         .marker(Marker::Braille)
         .x_bounds([0.0, w_dots])
         .y_bounds([0.0, h_dots])
         .paint(move |ctx| {
-            for (v, ry) in &grid {
+            for (_, ry) in &grid {
                 let mut x = 0.0;
                 while x < w_dots {
                     ctx.draw(&CLine {
@@ -829,22 +928,12 @@ fn mini_line_graph(
                     });
                     x += 5.0;
                 }
-                let n = if *v >= 1.0e6 {
-                    format!("{:.0}M", v / 1.0e6)
-                } else if *v >= 1.0e3 {
-                    format!("{:.0}k", v / 1.0e3)
-                } else {
-                    format!("{v:.0}")
-                };
-                let label = if *v == grid.iter().map(|(v, _)| *v).fold(f64::MAX, f64::min) {
-                    format!("{n} tok/s")
-                } else {
-                    n
-                };
+            }
+            for (y, text) in &labels {
                 ctx.print(
                     2.0,
-                    ry + 2.0,
-                    Span::styled(label, Style::new().fg(label_style.unwrap_or(color))),
+                    *y,
+                    Span::styled(text.clone(), Style::new().fg(label_style.unwrap_or(color))),
                 );
             }
             for (cx, h) in &cols {
@@ -856,13 +945,27 @@ fn mini_line_graph(
                     color,
                 });
             }
-            for (cx, _) in &ticks {
+            for w in overlay_tops.windows(2) {
+                let (i0, x0, y0) = w[0];
+                let (i1, x1, y1) = w[1];
+                if i1 != i0 + 1 {
+                    continue;
+                }
+                ctx.draw(&CLine {
+                    x1: x0,
+                    y1: y0,
+                    x2: x1,
+                    y2: y1,
+                    color: overlay_color,
+                });
+            }
+            for (cx, c) in &tick_dots {
                 ctx.draw(&CLine {
                     x1: *cx,
                     y1: 0.0,
                     x2: *cx,
                     y2: (h_dots * 0.08).max(2.0),
-                    color: ratatui::style::Color::Red,
+                    color: *c,
                 });
             }
         });
@@ -880,20 +983,10 @@ fn draw_latency(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect, d: Option<&Derive
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let mut lines: Vec<Line> = Vec::new();
-    if let Some(d) = d {
-        let w = ui.window_focus;
-        if !compact {
-            lines.push(lat_header(t));
-            for (name, lat) in [
-                ("time to first token (TTFT)", &d.ttft),
-                ("time between tokens (ITL)", &d.itl),
-                ("full answer (end-to-end)", &d.e2e),
-                ("queue time", &d.queue_time),
-            ] {
-                lines.push(lat_row(t, name, &lat[w], lat));
-            }
-        } else {
+    if compact {
+        let mut lines: Vec<Line> = Vec::new();
+        if let Some(d) = d {
+            let w = ui.window_focus;
             for (name, lat) in [
                 ("time to first token (TTFT)", &d.ttft),
                 ("time between tokens (ITL)", &d.itl),
@@ -901,29 +994,80 @@ fn draw_latency(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect, d: Option<&Derive
                 lines.push(lat_row_compact(t, name, &lat[w]));
             }
         }
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
     }
-    f.render_widget(Paragraph::new(lines), inner);
+
+    // left half: the numbers table (TTFT, ITL, queue time). The workload
+    // dependent e2e row and the multi-window p95 columns are gone. Right
+    // half holds the TTFT and cache-miss plots, widened by reclaimed columns.
+    let halves =
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(inner);
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(d) = d {
+        let w = ui.window_focus;
+        lines.push(lat_header(t));
+        for (name, lat) in [
+            ("TTFT", &d.ttft),
+            ("ITL", &d.itl),
+            ("queue time", &d.queue_time),
+        ] {
+            lines.push(lat_row(t, name, &lat[w]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines), halves[0]);
+    if let Some(d) = d {
+        let plots =
+            Layout::horizontal([Constraint::Ratio(1, 2), Constraint::Ratio(1, 2)]).split(halves[1]);
+        draw_ttft_plot(f, t, plots[0], d);
+        draw_cache_miss_plot(f, t, plots[1], d);
+    }
 }
 
-/// Subtitle: the percentile legend, plus prompt-length context when known.
+/// Subtitle: the percentile legend, plus the prompt + computed pair gloss
+/// (the prompt-length and uncached prompt-length p50 to p95 pair) when known.
 fn lat_subtitle(d: Option<&Derived>) -> String {
-    let mut s = String::from(
-        "p50 typical · p95 1-in-20 · p99 worst · right side: fresh p95 of each window's requests — bigger windows move slower only because they cover more time",
-    );
+    let mut s = String::from("p50 typical · p95 1-in-20 · p99 worst");
     if let Some(d) = d {
-        match (d.prompt_len_p50, d.prompt_len_p95) {
-            (Some(p50), Some(p95)) => s.push_str(&format!(
-                " · typical prompt {}–{} tok",
-                fmt_num(Some(p50)),
-                fmt_num(Some(p95))
-            )),
-            (Some(p50), None) => {
-                s.push_str(&format!(" · typical prompt {} tok", fmt_num(Some(p50))))
-            }
-            _ => {}
+        if let Some(gloss) = prompt_computed_gloss(d) {
+            s.push_str(&format!(" · {gloss}"));
         }
     }
     s
+}
+
+/// Prompt-size distributions behind the token rates, as p50 to p95
+/// spans: the prompts as submitted, and the prefix-cache misses the device
+/// chewed. Each half is None while its distribution has no data; a half-known
+/// span degrades to its single p50.
+fn prompt_size_span(d: &crate::derive::Derived) -> Option<String> {
+    size_span(d.prompt_len_p50, d.prompt_len_p95).map(|s| format!("prompt {s} tok"))
+}
+
+fn computed_size_span(d: &crate::derive::Derived) -> Option<String> {
+    size_span(d.computed_p50, d.computed_p95).map(|s| format!("computed {s} tok"))
+}
+
+fn size_span(p50: Option<f64>, p95: Option<f64>) -> Option<String> {
+    match (p50, p95) {
+        (Some(a), Some(b)) => Some(format!("{}–{}", fmt_num(Some(a)), fmt_num(Some(b)))),
+        (Some(a), None) => Some(fmt_num(Some(a))),
+        _ => None,
+    }
+}
+
+/// Pair gloss in the unit-once form,
+/// "prompt 27.5k–178.0k · computed 2.1k–9.0k tok". None while neither
+/// distribution has data.
+fn prompt_computed_gloss(d: &crate::derive::Derived) -> Option<String> {
+    let prompt = size_span(d.prompt_len_p50, d.prompt_len_p95);
+    let computed = size_span(d.computed_p50, d.computed_p95);
+    match (prompt, computed) {
+        (Some(p), Some(c)) => Some(format!("prompt {p} · computed {c} tok")),
+        (Some(p), None) => Some(format!("prompt {p} tok")),
+        (None, Some(c)) => Some(format!("computed {c} tok")),
+        (None, None) => None,
+    }
 }
 
 fn triple(v: &[Option<f64>; 3]) -> String {
@@ -933,36 +1077,21 @@ fn triple(v: &[Option<f64>; 3]) -> String {
         .join("/")
 }
 
-/// Header for the combined latency table: focused-window percentiles, then
-/// p95 across the three windows.
+/// Header for the half-width latency table: focused-window percentiles.
 fn lat_header(t: &Theme) -> Line<'static> {
     Line::from(vec![
-        Span::styled(" ".repeat(27), Style::new().fg(t.dim)),
+        Span::styled(" ".repeat(11), Style::new().fg(t.dim)),
         Span::styled(
             format!("{:>7}  {:>7}  {:>7}", "p50", "p95", "p99"),
-            Style::new().fg(t.dim).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("   │  ", Style::new().fg(t.dim)),
-        Span::styled(
-            format!(
-                "{:>7} {:>7} {:>7}",
-                "p95\u{b7}5s", "p95\u{b7}15s", "p95\u{b7}60s"
-            ),
             Style::new().fg(t.dim).add_modifier(Modifier::BOLD),
         ),
     ])
 }
 
-fn lat_row(
-    t: &Theme,
-    name: &str,
-    q: &crate::derive::Quantiles,
-    lat: &crate::derive::LatencyTriple,
-) -> Line<'static> {
+fn lat_row(t: &Theme, name: &str, q: &crate::derive::Quantiles) -> Line<'static> {
     let fmt = |v: Option<f64>| fmt_secs(v);
-    let wins = [fmt(lat[0].p95), fmt(lat[1].p95), fmt(lat[2].p95)];
     Line::from(vec![
-        Span::styled(format!(" {name:<26}"), Style::new().fg(t.fg)),
+        Span::styled(format!(" {name:<10}"), Style::new().fg(t.fg)),
         Span::styled(
             format!("{:>7}  ", fmt(q.p50)),
             Style::new().fg(latency_color(t, q.p50, q)),
@@ -974,11 +1103,6 @@ fn lat_row(
         Span::styled(
             format!("{:>7}", fmt(q.p99)),
             Style::new().fg(latency_color(t, q.p99, q)),
-        ),
-        Span::styled("   │  ", Style::new().fg(t.dim)),
-        Span::styled(
-            format!("{:>7} {:>7} {:>7}", wins[0], wins[1], wins[2]),
-            Style::new().fg(t.fg),
         ),
     ])
 }
@@ -1004,49 +1128,11 @@ fn lat_row_compact(t: &Theme, name: &str, q: &crate::derive::Quantiles) -> Line<
 
 // ---- detail ------------------------------------------------------------------
 
-fn queues_col_lines(d: Option<&Derived>, t: &Theme) -> Vec<Line<'static>> {
-    let mut l: Vec<Line> = Vec::new();
-    if let Some(d) = d {
-        let sq = &d.subqueues;
-        let val = |i: usize| -> String {
-            sq.get(i)
-                .map(|(_, v)| fmt_num(*v))
-                .unwrap_or_else(|| "\u{2014}".into())
-        };
-        let group = |label: &str, a: &str, b: &str| {
-            vec![
-                Line::from(Span::styled(format!(" {label}"), Style::new().fg(t.dim))),
-                Line::from(Span::styled(format!("  {a} · {b}"), Style::new().fg(t.fg))),
-            ]
-        };
-        l.extend(group(
-            "prefill queues:",
-            &format!("bootstrap {}", val(0)),
-            &format!("inflight {}", val(1)),
-        ));
-        l.extend(group(
-            "decode queues:",
-            &format!("prealloc {}", val(2)),
-            &format!("transfer {}", val(3)),
-        ));
-        if !val(4).is_empty() {
-            l.push(Line::from(Span::styled(
-                format!(" grammar: {}", val(4)),
-                Style::new().fg(t.fg),
-            )));
-        }
-    }
-    l
-}
-
+/// Generation: speculative decoding feel plus how far the running
+/// requests have generated; the cache family moved to the cache panel.
 fn quality_col_kvs(d: Option<&Derived>) -> Vec<Kv> {
     let mut q: Vec<Kv> = Vec::new();
     if let Some(d) = d {
-        q.push(Kv::plain(
-            "cache hit",
-            fmt_pct(d.cache_hit),
-            "how much of each new prompt it already remembers — high = fast starts",
-        ));
         q.push(Kv::plain(
             "spec accept",
             fmt_pct(d.spec_accept),
@@ -1060,32 +1146,80 @@ fn quality_col_kvs(d: Option<&Derived>) -> Vec<Kv> {
             ));
         }
         q.push(Kv::plain(
-            "l2 dev\u{b7}host",
-            format!("{} · {}", fmt_pct(d.l2_device), fmt_pct(d.l2_host)),
-            "prompt portions served from GPU / host RAM",
+            "agg tok generated",
+            format!("{} tok", fmt_num(d.gen_total)),
+            "so far, across running requests",
         ));
         q.push(Kv::plain(
-            "l2 wb\u{b7}rb",
-            format!("{} · {}", fmt_num(d.l2_wb), fmt_num(d.l2_rb)),
-            "tokens/s written to / read back from host tier",
-        ));
-        q.push(Kv::plain(
-            "gen depth",
+            "avg tok generated",
             format!("{} tok", fmt_num(d.gen_progress)),
-            "how far into their answers the current requests are",
+            "so far, per running request",
         ));
-        if let Some(r) = d.new_token_ratio {
-            q.push(Kv::plain(
-                "new-token ratio",
-                format!("{r:.2}"),
-                "scheduler policy knob (1.0 = default)",
-            ));
-        }
     }
     q
 }
 
-fn health_col_kvs(d: Option<&Derived>, focus: usize, t: &Theme) -> Vec<Kv> {
+/// Cache panel: prefix-cache hit fraction with the cached and computed
+/// throughput underneath, evictions, and the L2 tier traffic, all in one place.
+fn cache_col_kvs(d: Option<&Derived>, t: &Theme) -> Vec<Kv> {
+    let mut c: Vec<Kv> = Vec::new();
+    if let Some(d) = d {
+        let hit_color = match d.cache_hit {
+            Some(v) if v < 0.5 => t.bad,
+            Some(v) if v < 0.8 => t.warn,
+            Some(_) => t.good,
+            None => t.dim,
+        };
+        c.push(Kv::colored(
+            "cache hit",
+            fmt_pct(d.cache_hit),
+            "share of each new prompt the prefix cache already holds — high = fast starts",
+            hit_color,
+        ));
+        c.push(Kv::plain(
+            "cached·computed",
+            format!(
+                "{} · {}",
+                fmt_num(d.cache_cached),
+                fmt_num(d.cache_computed)
+            ),
+            "tok/s served from the cache · cache misses the GPU computed",
+        ));
+        c.push(Kv::colored(
+            "evictions/s",
+            fmt_num(d.evict_rate),
+            "device KV cache slots freed to make room",
+            trouble_color(t, d.evict_rate),
+        ));
+        c.push(Kv::plain(
+            "l2 dev\u{b7}host",
+            format!("{} · {}", fmt_pct(d.l2_device), fmt_pct(d.l2_host)),
+            "prompt portions served from GPU / host RAM",
+        ));
+        c.push(Kv::plain(
+            "l2 wb\u{b7}rb",
+            format!("{} · {}", fmt_num(d.l2_wb), fmt_num(d.l2_rb)),
+            "tokens/s written to / read back from host tier",
+        ));
+        c.push(Kv::colored(
+            "l2 drop/s",
+            fmt_num(d.l2_drop),
+            "device tokens destroyed without a host backup",
+            trouble_color(t, d.l2_drop),
+        ));
+    }
+    c
+}
+
+/// Health & trouble: the stalls row always shows. Binary alarm rows
+/// (retraction, 503, l2 drop) render full only after firing once in their
+/// session, collapsing into one dim line while quiet.
+fn health_col_kvs(
+    d: Option<&Derived>,
+    focus: usize,
+    t: &Theme,
+    alarms: &crate::derive::Alarms,
+) -> Vec<Kv> {
     let mut h: Vec<Kv> = Vec::new();
     if let Some(d) = d {
         let s = d.stalls[focus];
@@ -1108,35 +1242,42 @@ fn health_col_kvs(d: Option<&Derived>, focus: usize, t: &Theme) -> Vec<Kv> {
             "moments when prefill work froze every stream",
             scol,
         ));
-        h.push(Kv::colored(
-            "evictions/s",
-            fmt_num(d.evict_rate),
-            "device KV cache slots freed to make room",
-            trouble_color(t, d.evict_rate),
-        ));
-        h.push(Kv::colored(
-            "retractions/s",
-            fmt_num(d.retract_rate),
-            "requests restarted mid-answer — the worst kind",
-            trouble_color(t, d.retract_rate),
-        ));
-        h.push(Kv::colored(
-            "503/s",
-            fmt_num(d.http_503_rate),
-            "requests refused outright",
-            trouble_color(t, d.http_503_rate),
-        ));
-        h.push(Kv::colored(
-            "l2 drop/s",
-            fmt_num(d.l2_drop),
-            "device tokens destroyed without a host backup",
-            trouble_color(t, d.l2_drop),
-        ));
-        h.push(Kv::plain(
-            "http active",
-            fmt_num(d.http_active),
-            "connections open right now",
-        ));
+        let mut quiet: Vec<&str> = Vec::new();
+        if alarms.retraction {
+            h.push(Kv::colored(
+                "retractions/s",
+                fmt_num(d.retract_rate),
+                "requests restarted mid-answer — the worst kind",
+                trouble_color(t, d.retract_rate),
+            ));
+        } else {
+            quiet.push("retraction");
+        }
+        if alarms.http_503 {
+            h.push(Kv::colored(
+                "503/s",
+                fmt_num(d.http_503_rate),
+                "requests refused outright",
+                trouble_color(t, d.http_503_rate),
+            ));
+        } else {
+            quiet.push("503");
+        }
+        if alarms.l2_drop {
+            h.push(Kv::colored(
+                "l2 drop/s",
+                fmt_num(d.l2_drop),
+                "device tokens destroyed without a host backup",
+                trouble_color(t, d.l2_drop),
+            ));
+        } else {
+            quiet.push("l2 drop");
+        }
+        if !quiet.is_empty() {
+            // compact channel names: the line shares the panel with the full
+            // rows it replaces
+            h.push(Kv::gloss_only(format!("quiet: {}", quiet.join("·"))));
+        }
         h.push(Kv::plain(
             "cpu cores/s",
             format!(
@@ -1154,50 +1295,48 @@ fn health_col_kvs(d: Option<&Derived>, focus: usize, t: &Theme) -> Vec<Kv> {
     h
 }
 
-fn peaks_col_lines(
-    d: Option<&Derived>,
-    peaks: &crate::derive::Peaks,
-    t: &Theme,
-) -> Vec<Line<'static>> {
-    let pk = |label: &str, v: Option<f64>| {
+fn peaks_col_lines(peaks: &crate::derive::Peaks, t: &Theme) -> Vec<Line<'static>> {
+    // the single row carries the single-stream s3 color, matching
+    // the decode canvas's own single-stream line color
+    let pk = |label: &str, v: Option<f64>, color: ratatui::style::Color| {
         Line::from(vec![
             Span::styled(format!(" {label:<9}"), Style::new().fg(t.dim)),
             Span::styled(
                 v.map(|v| format!("{v:.0} tok/s"))
                     .unwrap_or_else(|| "\u{2014}".into()),
-                Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
+                Style::new().fg(color).add_modifier(Modifier::BOLD),
             ),
         ])
     };
-    let mut l = vec![
-        pk("decode", peaks.decode),
-        pk("prefill", peaks.prefill),
-        pk("single", peaks.decode_single),
+    let l = vec![
+        pk("decode", peaks.decode, t.fg),
+        pk("prefill", peaks.prefill, t.fg),
+        pk("single", peaks.decode_single, t.s3),
     ];
-    l.push(Line::from(vec![
-        Span::styled(" engine   ".to_string(), Style::new().fg(t.dim)),
-        Span::styled(
-            d.map(|d| tok_gauge(d.gen_throughput_gauge))
-                .unwrap_or_else(|| "\u{2014}".into()),
-            Style::new().fg(t.fg),
-        ),
-    ]));
     l
 }
 
-/// Rows the detail row needs (content + borders), bounded to [9, 14].
-fn detail_height(d: Option<&Derived>, focus: usize) -> u16 {
+/// Rows the detail row needs (content plus borders), bounded to [8, 14].
+/// The lower bound leaves the super-large rate graphs their height share.
+/// Sized by the live session state: a latched alarm adds its full
+/// row to the health column, so the quiet-state shape would clip it.
+fn detail_height(
+    d: Option<&Derived>,
+    focus: usize,
+    alarms: &crate::derive::Alarms,
+    peaks: &crate::derive::Peaks,
+) -> u16 {
     let t = &THEMES[0];
     let n = [
-        queues_col_lines(d, t).len(),
         quality_col_kvs(d).len(),
-        health_col_kvs(d, focus, t).len(),
-        peaks_col_lines(d, &crate::derive::Peaks::default(), t).len(),
+        cache_col_kvs(d, t).len(),
+        health_col_kvs(d, focus, t, alarms).len(),
+        peaks_col_lines(peaks, t).len(),
     ]
     .into_iter()
     .max()
     .unwrap_or(0);
-    (n as u16 + 2).clamp(9, 14)
+    (n as u16 + 2).clamp(8, 14)
 }
 
 fn draw_detail(
@@ -1207,28 +1346,28 @@ fn draw_detail(
     area: Rect,
     d: Option<&Derived>,
     compact: bool,
-    peaks: &crate::derive::Peaks,
+    session: &crate::scrape::Shared,
 ) {
+    // the two session-sticky structures are read here, after the history
+    // guard has been dropped upstream
+    let peaks = session.peaks.lock().unwrap();
+    let alarms = session.alarms.lock().unwrap();
     let focus = ui.window_focus;
     if compact {
         let mut text = String::new();
         if let Some(d) = d {
-            let sq: Vec<String> = d
-                .subqueues
-                .iter()
-                .map(|(n, v)| format!("{} {}", n, fmt_num(*v)))
-                .collect();
             text.push_str(&format!(
-                "queues: {} · cache hit {} · spec accept {} · gen depth {} tok",
-                sq.join(" · "),
+                "cache hit {} · cached·computed {}·{} · spec accept {} · avg gen {} tok",
                 fmt_pct(d.cache_hit),
+                fmt_num(d.cache_cached),
+                fmt_num(d.cache_computed),
                 fmt_pct(d.spec_accept),
                 fmt_num(d.gen_progress)
             ));
             text.push('\n');
             let s = d.stalls[focus];
             text.push_str(&format!(
-                "stalls {} × {:.1}s in {} · evict/s {} · retract/s {} · 503/s {} · active {}",
+                "stalls {} × {:.1}s in {} · evict/s {} · retract/s {} · 503/s {}",
                 s.count,
                 if s.count > 0 {
                     s.seconds / s.count.max(1) as f64
@@ -1238,8 +1377,7 @@ fn draw_detail(
                 WIN_LABELS[focus],
                 fmt_num(d.evict_rate),
                 fmt_num(d.retract_rate),
-                fmt_num(d.http_503_rate),
-                fmt_num(d.http_active)
+                fmt_num(d.http_503_rate)
             ));
         }
         let b = block(t, "Queues & health", None);
@@ -1253,30 +1391,30 @@ fn draw_detail(
 
     let cols = Layout::horizontal([
         Constraint::Percentage(24),
-        Constraint::Percentage(25),
+        Constraint::Percentage(24),
         Constraint::Percentage(28),
-        Constraint::Percentage(23),
+        Constraint::Percentage(24),
     ])
     .split(area);
 
-    let b1 = block(t, "Waiting lines", Some("requests staged before running"));
+    let b1 = block(t, "Generation", Some("in-flight request stats"));
+    let q = quality_col_kvs(d);
     let inner1 = b1.inner(cols[0]);
-    let l1 = queues_col_lines(d, t)
-        .into_iter()
-        .map(|l| truncate_line(l, inner1.width as usize))
-        .collect::<Vec<Line>>();
-    f.render_widget(Paragraph::new(l1), inner1);
+    f.render_widget(
+        Paragraph::new(kv_lines(t, q, inner1.width as usize)),
+        inner1,
+    );
     f.render_widget(b1, cols[0]);
 
     let b2 = block(
         t,
-        "Answer quality",
-        Some("what makes the model feel fast or smart"),
+        "Cache",
+        Some("prefix-cache hits, traffic and the L2 tiers"),
     );
-    let q = quality_col_kvs(d);
+    let c = cache_col_kvs(d, t);
     let inner2 = b2.inner(cols[1]);
     f.render_widget(
-        Paragraph::new(kv_lines(t, q, inner2.width as usize)),
+        Paragraph::new(kv_lines(t, c, inner2.width as usize)),
         inner2,
     );
     f.render_widget(b2, cols[1]);
@@ -1286,7 +1424,7 @@ fn draw_detail(
         "Health & trouble",
         Some("anything here that is not zero deserves a look"),
     );
-    let h = health_col_kvs(d, focus, t);
+    let h = health_col_kvs(d, focus, t, &alarms);
     let inner3 = b3.inner(cols[2]);
     f.render_widget(
         Paragraph::new(kv_lines(t, h, inner3.width as usize)),
@@ -1296,7 +1434,7 @@ fn draw_detail(
 
     let b4 = block(t, "Peaks", Some("since sgtop started"));
     let inner4 = b4.inner(cols[3]);
-    let l4 = peaks_col_lines(d, peaks, t)
+    let l4 = peaks_col_lines(&peaks, t)
         .into_iter()
         .map(|l| truncate_line(l, inner4.width as usize))
         .collect::<Vec<Line>>();
@@ -1498,15 +1636,15 @@ fn draw_explain(f: &mut Frame, ui: &Ui, t: &Theme, area: Rect) {
         }
     };
     section("A token", "A token is roughly a word-piece: the model reads your prompt and writes its answer one token at a time, several times per second. \"tok/s\" below is how many of those pieces appear per second.", &mut lines);
-    section("Words out / prefill", "Words out (decode) is the model writing its answer — the number users experience as speed. Prefill is the model reading a new prompt; it happens in bursts and can momentarily freeze everyone else's stream (the seesaw in the graph).", &mut lines);
+    section("Token rates (TOKEN/s)", "Decode is the model writing its answer — the number users experience as speed. Prefill is the model reading a new prompt; it happens in bursts and can momentarily freeze everyone else's stream (the seesaw in the graph). The prompt + computed gloss names both size distributions behind those rates: the prompts as submitted, and the prefix-cache misses the GPU computed.", &mut lines);
     section("Time to first token (TTFT)", "When you send a message, this is the pause before the first word appears. Small is good. It grows when the model is busy reading long prompts or when there is a line of requests waiting.", &mut lines);
-    section("Time between tokens (ITL) & speed per stream", "Once words are flowing, ITL is the rhythm: the time between one word and the next. Steady and small means the text streams smoothly; spikes are why text sometimes freezes then jumps — usually a new request's prompt being processed in the middle of your answer.\n\nThe Speed-per-stream graph shows the same story from the other side: total writing speed divided by how many answers are being written at once. When it dips while the seesaw graph shows a prefill spike, everyone's stream briefly froze.", &mut lines);
-    section("p50 / p95 / p99", "p50 is a typical request. p95 is the experience of the unluckiest 1-in-20. p99 is the worst moments. If p50 is fine but p95 is bad, most people are happy but some are having a bad time — that gap is the number to watch.\n\nThe 5s/15s/60s columns are a fresh p95 of just that window's requests — nothing is averaged with the past, so a single slow request shows up in the 5s column immediately. Bigger windows move slower only because they cover more requests.", &mut lines);
-    section("Waiting line (queue)", "Requests that arrived but have not started. A short, spiky line is normal. A tall, flat line means the server is overloaded and everyone's wait grows.", &mut lines);
+    section("Time between tokens (ITL)", "Once words are flowing, ITL is the rhythm: the time between one word and the next. Steady and small means the text streams smoothly; spikes are why text sometimes freezes then jumps — usually a new request's prompt being processed in the middle of your answer.\n\nThe decode graph draws a second line for the single-stream speed: total writing speed divided by how many answers are being written at once. When that line dips while a prefill burst rides the same graph, everyone's stream briefly froze.", &mut lines);
+    section("p50 / p95 / p99", "p50 is a typical request. p95 is the experience of the unluckiest 1-in-20. p99 is the worst moments. If p50 is fine but p95 is bad, most people are happy but some are having a bad time — that gap is the number to watch.\n\nThe latency row plots first-token wait (TTFT, its p95 shaded) next to the cache-miss rate: computed prompt tokens per second, the prompt text the prefix cache did not hold. Queue time isolates congestion — how long requests waited for their turn — while end-to-end latency also grows with the work itself, so it stays out of the plots (once-mode still prints it).", &mut lines);
+    section("Waiting (QUEUE)", "QUEUE counts requests that arrived but have not started. A short, spiky line is normal; a tall, flat line means the server is overloaded and everyone's wait grows. The latency table's queue row shows how long they waited.", &mut lines);
     section("Peaks", "The Peak box holds the highest rates seen since sgtop started: the busiest decode moment, the biggest prefill burst, and single — the fastest one stream has ever moved (total decode speed divided by how many requests were sharing it).", &mut lines);
     section("Memory pools", "The model keeps working memory for every conversation in progress (KV), and optionally for alternative memory types (mamba, SWA). At 100% a pool is full: new requests wait, and the server may throw out or restart old ones (see evictions and retractions).\n\nThe host tier is the exception: it is a large CPU-RAM cache of prompt prefixes that stays pinned near 100% in normal operation and recycles the oldest entries when it needs room. A full host tier is not a problem — only KV or mamba running full is. The evictions/s counter belongs to the device KV cache, not the host tier.", &mut lines);
-    section("Stalls", "A stall is a moment when every stream froze because a prompt was being read. Measured as how many times it happened and how many seconds in total over the window.", &mut lines);
-    section("Cache hit & the L2 tiers", "How much of each new prompt the server already remembers from earlier turns. High cache hit = fast starts and less work. A sudden drop usually means a restart or very different traffic.\n\nLarge servers often keep a second, bigger cache tier in host RAM (the \"host\" pool). The l2 dev\u{b7}host line shows how much of the recent prefill work was served from the GPU-resident tier vs the host tier; wb\u{b7}rb is how many tokens per second are being written down to, or read back from, that tier. l2 drop/s counts device tokens destroyed without a host backup \u{2014} work the host tier failed to save; it should be zero.", &mut lines);
+    section("Stalls", "A stall is a moment when every stream froze because a prompt was being read. Measured as how many times it happened and how many seconds in total over the window. Red ticks mark stalled intervals on the decode and latency plots; orange ticks there mark intervals where the eviction counter advanced (device KV cache freed to make room).", &mut lines);
+    section("Cache hit & the L2 tiers", "How much of each new prompt the server already remembers from earlier turns. The cache-misses plot tracks the opposite side: computed prompt tokens/s, the text the GPU had to read because no cache tier held it. High cache hit = fast starts and less work. A sudden drop usually means a restart or very different traffic.\n\nLarge servers often keep a second, bigger cache tier in host RAM (the \"host\" pool). The l2 dev\u{b7}host line shows how much of the recent prefill work was served from the GPU-resident tier vs the host tier; wb\u{b7}rb is how many tokens per second are being written down to, or read back from, that tier. l2 drop/s counts device tokens destroyed without a host backup \u{2014} work the host tier failed to save; it should be zero.", &mut lines);
     section("Speculative accept", "The model tries to guess several words ahead and checks them in one go. Accept rate is how often the guesses are right; accept length is how many words each lucky guess saves. High numbers make everything feel faster.", &mut lines);
     section("Retractions & evictions", "A retraction means a running request was abandoned and restarted — its user watched their answer reset. Evictions free device KV cache slots to make room; the freed prefixes may already be backed up to the host tier, so steady recycling is normal while a spike means memory pressure. l2 drop/s is the harmful one: device tokens destroyed without a host backup, work truly lost.", &mut lines);
 
@@ -1595,18 +1733,18 @@ pub fn fmt_tokens(v: f64) -> String {
     }
 }
 
-/// "20% (116k / 1.3M)" when counts are known, else just the percentage.
-fn pool_value(p: &crate::derive::Pool) -> String {
+/// Absolute pool occupancy for the pools text lines: "8k/10k tok" for token pools,
+/// "14/16 slots" for mamba. Percentages stay out of these lines: a count's denominator
+/// supports no action, and the hero's pools cell colors its readings by the worst
+/// non-host fullness (the requests-will-wait warning). None when no counts
+/// are reported (callers then show the pool's name alone).
+pub(crate) fn pool_value(p: &crate::derive::Pool) -> Option<String> {
     match (p.used, p.total) {
         (Some(u), Some(t)) if t > 0.0 => {
-            let counts = format!("{} / {}", fmt_tokens(u), fmt_tokens(t));
-            if p.unit == "slots" {
-                format!("{} ({} slots)", fmt_pct(Some(p.usage)), counts)
-            } else {
-                format!("{} ({})", fmt_pct(Some(p.usage)), counts)
-            }
+            let unit = if p.unit == "slots" { "slots" } else { "tok" };
+            Some(format!("{}/{} {}", fmt_tokens(u), fmt_tokens(t), unit))
         }
-        _ => fmt_pct(Some(p.usage)),
+        _ => None,
     }
 }
 
@@ -1617,8 +1755,4 @@ fn fmt_secs(v: Option<f64>) -> String {
         Some(v) => format!("{:.0}ms", v * 1000.0),
         None => "—".into(),
     }
-}
-
-fn tok_gauge(v: Option<f64>) -> String {
-    v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into())
 }
