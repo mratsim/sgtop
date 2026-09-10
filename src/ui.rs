@@ -693,17 +693,20 @@ fn draw_ttft_plot(f: &mut Frame, t: &Theme, area: Rect, d: &Derived) {
     };
     let scale = g.ttft_p95.iter().filter_map(|v| *v).fold(0.0_f64, f64::max);
     let (ref_lines, ymax) = grid_for_scale(scale, t);
+    // latency is a lower-is-better metric, so the fill color follows
+    // the latest p95: green only while genuinely good, amber or red
+    // as it worsens; a static green fill reads as healthy
+    // at any magnitude, which is exactly wrong
+    let p95_now = d.ttft[2].p95;
+    let lat_color = latency_color(t, p95_now, &d.ttft[2]);
     let title = Line::from(vec![
         Span::styled(" TTFT ", Style::new().fg(t.fg).add_modifier(Modifier::BOLD)),
-        // legend: p95 (shaded area), p50 (the line over it)
+        // legend: the p95 series (the only series plotted)
         Span::styled(
             "\u{25cf} ",
-            Style::new().fg(t.s1).add_modifier(Modifier::BOLD),
+            Style::new().fg(lat_color).add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            "\u{25cf}",
-            Style::new().fg(t.accent).add_modifier(Modifier::BOLD),
-        ),
+        Span::styled("p95", Style::new().fg(t.dim)),
     ]);
     // the subtitle carries the prompt half of the size gloss: the cache-miss
     // plot carries the computed half, the table's subtitle holds the full pair
@@ -718,11 +721,11 @@ fn draw_ttft_plot(f: &mut Frame, t: &Theme, area: Rect, d: &Derived) {
         &g.ttft_p95,
         &g.dt,
         ymax,
-        t.s1,
+        lat_color,
         PlotDress {
             unit: "s",
             ticks: Some(ticks),
-            overlay: Some((g.ttft_p50.as_slice(), t.accent)),
+            overlay: None,
             ref_lines: &ref_lines,
         },
     );
@@ -1294,8 +1297,8 @@ fn health_col_kvs(
 }
 
 fn peaks_col_lines(peaks: &crate::derive::Peaks, t: &Theme) -> Vec<Line<'static>> {
-    // the single row carries the single-stream s3 color, matching the
-    // decode canvas's own single-stream line color
+    // the single row carries the single-stream s3 color, matching
+    // the decode canvas's own single-stream line color
     let pk = |label: &str, v: Option<f64>, color: ratatui::style::Color| {
         Line::from(vec![
             Span::styled(format!(" {label:<9}"), Style::new().fg(t.dim)),
