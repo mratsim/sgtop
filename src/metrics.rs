@@ -36,7 +36,9 @@ impl std::fmt::Display for SeriesKey {
 /// Cumulative histogram state at one scrape, for one label combination.
 #[derive(Debug, Clone, Default)]
 pub struct HistSeries {
-    /// Upper bounds, ascending; last entry is `f64::INFINITY`.
+    /// Upper bounds, ascending; last entry is `f64::INFINITY`. Bounds are
+    /// finite or +Inf — NaN bounds are dropped at the parse boundary, so
+    /// any two bounds always order.
     pub le: Vec<f64>,
     /// Cumulative counts, parallel to `le`.
     pub counts: Vec<f64>,
@@ -152,10 +154,12 @@ pub fn parse(body: &str) -> anyhow::Result<Sample> {
         // Histogram families announce themselves via `# TYPE <base> histogram`;
         // their samples are the base name suffixed with _bucket/_sum/_count.
         let (base, part, le) = if let Some(b) = name.strip_suffix("_bucket") {
+            // a usable bound is finite or +Inf (a NaN bound cannot be ordered)
             let le = labels
                 .iter()
                 .find(|(k, _)| k == "le")
-                .and_then(|(_, v)| parse_value(v));
+                .and_then(|(_, v)| parse_value(v))
+                .filter(|le| le.is_finite() || *le == f64::INFINITY);
             (b, 0, le)
         } else if let Some(b) = name.strip_suffix("_sum") {
             (b, 1, None)
@@ -304,5 +308,9 @@ fn parse_labels(src: &str) -> Vec<(String, String)> {
         }
         out.push((name, value));
     }
+    // canonical order: the same label set emitted in two different orders
+    // must resolve to one series key, so an exporter rotating label order
+    // between scrapes cannot fork the series and fabricate a spike
+    out.sort();
     out
 }

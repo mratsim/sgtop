@@ -265,11 +265,17 @@ fn interval_rate(old: &crate::metrics::Sample, new: &crate::metrics::Sample, mod
     let mut delta = 0.0;
     for (k, v_new) in &new.simple {
         if key(k) {
-            let v_old = old.simple.get(k).copied().unwrap_or(0.0);
-            delta += if *v_new < v_old {
+            // a key absent from the earlier sample is a new series
+            // (first appearance, or reappearance after a gap): never
+            // pair it with a pre-gap sample, so no fabricated spike
+            // reaches the peaks or the graph lanes
+            let Some(v_old) = old.simple.get(k) else {
+                continue;
+            };
+            delta += if *v_new < *v_old {
                 *v_new
             } else {
-                *v_new - v_old
+                *v_new - *v_old
             };
         }
     }

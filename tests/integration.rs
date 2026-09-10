@@ -404,6 +404,7 @@ fn histogram_bucket_without_le_is_skipped_not_fatal() {
 # TYPE m:lat histogram
 m:lat_count{mode=\"decode\"} 2
 m:lat_bucket{mode=\"decode\"} 1
+m:lat_bucket{mode=\"decode\",le=\"NaN\"} 5
 m:lat_bucket{mode=\"decode\",le=\"10\"} 2
 m:other_gauge 7
 ";
@@ -612,4 +613,199 @@ sglang:mamba_usage 0.5
         mamba_absent.usage, 0.5,
         "usage must fall back to the prior in-window reading"
     );
+}
+
+// ---- windowed-delta semantics: reappearance, label order, ladder pairing ----
+
+fn mix_without_decode(prefill: f64) -> Sample {
+    parse(&format!(
+        "# TYPE sglang:realtime_tokens_total counter\n\
+         sglang:realtime_tokens_total{{mode=\"prefill_compute\"}} {prefill}\n\
+         # TYPE sglang:num_running_reqs gauge\n\
+         sglang:num_running_reqs 4\n"
+    ))
+    .unwrap()
+}
+
+fn counter_with_gap(values: [Option<f64>; 5]) -> History {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    for (i, v) in values.iter().enumerate() {
+        let mut body = String::from("# TYPE m:other gauge\nm:other 1\n");
+        if let Some(v) = v {
+            body.push_str(&format!("# TYPE m:c counter\nm:c {v}\n"));
+        }
+        h.push(
+            t0 + Duration::from_secs(i as u64 * 10),
+            parse(&body).unwrap(),
+        );
+    }
+    h
+}
+
+// A counter that vanishes for one or more scrapes and later reappears
+// counts as a new series from the reappearance point. Pairing the first
+// reappearance sample with a pre-gap sample would fabricate a spike
+// (higher value) or a fake reset (lower value).
+#[test]
+fn reappearance_after_gap_is_not_paired_with_the_pre_gap_sample() {
+    let h = counter_with_gap([Some(100.0), Some(150.0), None, Some(160.0), Some(220.0)]);
+    let rate = h
+        .rate_sum(|k| k.name == "m:c", Duration::from_secs(60))
+        .unwrap();
+    // paired deltas 50 + 60 over 40s (the reappearance interval adds 0)
+    assert!((rate - 2.75).abs() < 1e-9, "rate was {rate}");
+}
+
+// A reappearance whose value is lower than the pre-gap reading follows
+// the same rule: no pairing across the gap, and the next interval
+// measures against the reappearance value itself.
+#[test]
+fn reappearance_after_gap_with_lower_value_starts_fresh() {
+    let h = counter_with_gap([Some(100.0), Some(150.0), None, Some(40.0), Some(90.0)]);
+    let rate = h
+        .rate_sum(|k| k.name == "m:c", Duration::from_secs(60))
+        .unwrap();
+    // paired deltas 50 + 50 over 40s
+    assert!((rate - 2.5).abs() < 1e-9, "rate was {rate}");
+}
+
+// Flagged intervals must be exactly the intervals whose earlier sample
+// lacks the series, and every other interval must keep its true delta.
+// The decoded rate vector below pins those positions exactly.
+#[test]
+fn reappearance_intervals_are_exactly_those_after_an_absent_predecessor() {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    // decode counter absent at entry 2, present everywhere else
+    h.push(t0, mix(0.0, 0.0));
+    h.push(t0 + Duration::from_secs(1), mix(10.0, 0.0));
+    h.push(t0 + Duration::from_secs(2), mix_without_decode(0.0));
+    h.push(t0 + Duration::from_secs(3), mix(30.0, 0.0));
+    h.push(t0 + Duration::from_secs(4), mix(60.0, 0.0));
+    let d = derive(&h, 0).unwrap();
+    // interval 2 (reappearance) contributes 0, the vanished interval has
+    // nothing to sum, and the others keep their true deltas
+    let expected = [10.0, 0.0, 0.0, 30.0];
+    assert_eq!(
+        d.graphs.decode.len(),
+        expected.len(),
+        "decode lanes were {:?}",
+        d.graphs.decode
+    );
+    for (i, (got, want)) in d.graphs.decode.iter().zip(expected.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "decode lane {i} was {got}, expected {want} (lanes {:?})",
+            d.graphs.decode
+        );
+    }
+}
+
+// Session peaks must not record the fabricated rate of a reappearance
+// interval: the interval that brings the series back contributes no rate.
+#[test]
+fn reappearance_does_not_record_a_peak_spike() {
+    use sgtop::derive::{update_peaks, Peaks};
+
+    let mut h = History::default();
+    let mut peaks = Peaks::default();
+    let t0 = Instant::now();
+    h.push(t0, mix(0.0, 0.0));
+    h.push(t0 + Duration::from_secs(1), mix(100.0, 0.0));
+    update_peaks(&mut peaks, &h);
+    assert_eq!(peaks.decode, Some(100.0));
+    h.push(t0 + Duration::from_secs(2), mix_without_decode(0.0));
+    update_peaks(&mut peaks, &h);
+    h.push(t0 + Duration::from_secs(3), mix(400.0, 0.0));
+    update_peaks(&mut peaks, &h);
+    assert_eq!(
+        peaks.decode,
+        Some(100.0),
+        "the reappearance interval must not feed the session peak"
+    );
+}
+
+// Two scrapes of the same metric whose labels are emitted in different
+// orders are one series, not two: label order must not affect identity,
+// or the "new" series fabricates a full-value delta on its first pair.
+#[test]
+fn label_emit_order_does_not_fork_series_identity() {
+    let a = parse("# TYPE m:c counter\nm:c{a=\"x\",b=\"y\"} 100\n").unwrap();
+    let b = parse("# TYPE m:c counter\nm:c{b=\"y\",a=\"x\"} 150\n").unwrap();
+    let key_a = a.simple.keys().next().unwrap().clone();
+    assert!(
+        b.simple.contains_key(&key_a),
+        "reordered labels must resolve to the same series key"
+    );
+    let mut h = History::default();
+    let t0 = Instant::now();
+    h.push(t0, a);
+    h.push(t0 + Duration::from_secs(10), b);
+    let rate = h
+        .rate_sum(|k| k.name == "m:c", Duration::from_secs(60))
+        .unwrap();
+    assert!((rate - 5.0).abs() < 1e-9, "rate was {rate}");
+}
+
+// Histogram bucket counts must pair on the `le` boundary value, never
+// on list position: a bucket inserted mid-ladder between two samples
+// shifts every later index pairing, and the shifted deltas can stay
+// non-negative, so only boundary-keyed pairing keeps the quantile sane.
+#[test]
+fn mid_ladder_bucket_insertion_pairs_quantiles_by_boundary() {
+    let mut h = History::default();
+    let t0 = Instant::now();
+    let old_body = "# TYPE m:lat histogram\n\
+        m:lat_bucket{le=\"0.1\"} 2\nm:lat_bucket{le=\"1\"} 19\nm:lat_bucket{le=\"+Inf\"} 20\n\
+        m:lat_count 20\nm:lat_sum 9.0\n";
+    let new_body = "# TYPE m:lat histogram\n\
+        m:lat_bucket{le=\"0.1\"} 7\nm:lat_bucket{le=\"0.5\"} 19\n\
+        m:lat_bucket{le=\"1\"} 29\nm:lat_bucket{le=\"+Inf\"} 30\n\
+        m:lat_count 30\nm:lat_sum 14.0\n";
+    h.push(t0, parse(old_body).unwrap());
+    h.push(t0 + Duration::from_secs(1), parse(new_body).unwrap());
+    let p50 = h
+        .hist_quantile(|k| k.name == "m:lat", 0.5, Duration::from_secs(60))
+        .unwrap();
+    let p95 = h
+        .hist_quantile(|k| k.name == "m:lat", 0.95, Duration::from_secs(60))
+        .unwrap();
+    // shared-boundary window deltas: +5 at le=0.1, +10 at le=1
+    // p50 rank 5 sits exactly on the le=0.1 boundary, p95 rank 9.5
+    // interpolates inside the (0.1, 1] bucket
+    assert!((p50 - 0.1).abs() < 1e-9, "p50 was {p50}");
+    assert!((p95 - 0.91).abs() < 1e-9, "p95 was {p95}");
+}
+
+// A bucket with an `le` bound of NaN cannot be ordered, so parse must
+// drop it: a retained NaN bound wedges the boundary-keyed delta walk
+// and silently truncates deltas at later boundaries. The +Inf bound
+// is the standard top bucket and stays valid.
+#[test]
+fn nan_le_bound_is_dropped_and_quantiles_stay_sane() {
+    let old_body = "# TYPE m:lat histogram\n\
+        m:lat_bucket{le=\"0.1\"} 10\nm:lat_bucket{le=\"NaN\"} 15\n\
+        m:lat_bucket{le=\"1\"} 19\nm:lat_bucket{le=\"+Inf\"} 20\n\
+        m:lat_count 20\nm:lat_sum 9.0\n";
+    let new_body = "# TYPE m:lat histogram\n\
+        m:lat_bucket{le=\"0.1\"} 14\nm:lat_bucket{le=\"1\"} 29\n\
+        m:lat_bucket{le=\"+Inf\"} 30\nm:lat_count 30\nm:lat_sum 14.0\n";
+    let old = parse(old_body).unwrap();
+    let key = old.hist.keys().next().unwrap().clone();
+    let h = &old.hist[&key];
+    // only usable bounds survive: the NaN bound must not be stored
+    assert_eq!(h.le, vec![0.1, 1.0, f64::INFINITY]);
+    assert_eq!(h.counts, vec![10.0, 19.0, 20.0]);
+
+    let mut hist = History::default();
+    let t0 = Instant::now();
+    hist.push(t0, old);
+    hist.push(t0 + Duration::from_secs(1), parse(new_body).unwrap());
+    // shared-boundary deltas: +4 at le=0.1, +10 at le=1
+    // p50 rank 5 interpolates inside the (0.1, 1] bucket
+    let p50 = hist
+        .hist_quantile(|k| k.name == "m:lat", 0.5, Duration::from_secs(60))
+        .unwrap();
+    assert!((p50 - 0.25).abs() < 1e-9, "p50 was {p50}");
 }
