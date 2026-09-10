@@ -13,12 +13,6 @@ binary, no storage, no daemon.
 </p>
 
 <p align="center">
-  <img src="media/screenshot-load.png" alt="(pre-revision UI) sgtop under
-  sustained load: three stalls in 60s flagged in the hero, evictions/s
-  counter lit, and the decode graph tracking throughput" width="100%">
-</p>
-
-<p align="center">
   <img src="media/screenshot-stress.png" alt="sgtop under stress: prefill
   bursts near 10k tok/s while decode starves to zero, a red tick fence on
   the decode canvas marking 27 freezes (28.7s frozen in 60s), the TTFT
