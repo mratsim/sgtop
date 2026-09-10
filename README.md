@@ -6,9 +6,10 @@ binary, no storage, no daemon.
 
 <p align="center">
   <img src="media/screenshot.png" alt="sgtop dashboard: full-width prefill
-  and decode graphs with the single-stream line and stream avg/peak, TTFT
-  and cache-miss plots with stall and eviction ticks, latency percentiles,
-  and the Generation, Cache, Health and Peaks panels" width="100%">
+  and decode graphs with the single-stream line in its own color, stream
+  avg and peak on the legend line, the TTFT plot colored by how good its
+  p95 is (amber here), a cache-miss plot with eviction ticks, a fired
+  stall in the health panel, and the folded quiet-alarm row" width="100%">
 </p>
 
 <p align="center">
