@@ -35,24 +35,6 @@ fn pct(v: Option<f64>) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
-fn pool_value(p: &derive::Pool) -> String {
-    match (p.used, p.total) {
-        (Some(u), Some(t)) if t > 0.0 => {
-            let counts = format!(
-                "{} / {}",
-                crate::ui::fmt_tokens(u),
-                crate::ui::fmt_tokens(t)
-            );
-            if p.unit == "slots" {
-                format!("{} ({} slots)", pct(Some(p.usage)), counts)
-            } else {
-                format!("{} ({})", pct(Some(p.usage)), counts)
-            }
-        }
-        _ => pct(Some(p.usage)),
-    }
-}
-
 fn num(v: Option<f64>) -> String {
     v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into())
 }
@@ -71,7 +53,10 @@ fn print_snapshot(d: &Derived, peaks: &derive::Peaks) -> String {
         num(d.queue),
         d.pools
             .iter()
-            .map(|p| format!("{} {}", p.name, pool_value(p)))
+            .map(|p| match crate::ui::pool_value(p) {
+                Some(v) => format!("{} {v}", p.name),
+                None => p.name.to_string(),
+            })
             .collect::<Vec<_>>()
             .join(" / ")
     ));
@@ -95,14 +80,6 @@ fn print_snapshot(d: &Derived, peaks: &derive::Peaks) -> String {
             secs(q.p99)
         ));
     }
-    lines.push(format!(
-        "queues: {}",
-        d.subqueues
-            .iter()
-            .map(|(n, v)| format!("{n} {}", num(*v)))
-            .collect::<Vec<_>>()
-            .join(" · ")
-    ));
     let pk = |v: Option<f64>| v.map(|v| format!("{v:.0}")).unwrap_or_else(|| "—".into());
     lines.push(format!(
         "l2: dev {} · host {} · wb {} tok/s · rb {} tok/s · drop {} tok/s",
@@ -146,6 +123,50 @@ mod tests {
     // first line or inject terminal control sequences through it: sanitization
     // applies to every display-bound string, and its 256-character bound
     // holds here uniformly (real labels are far shorter).
+    // Pools line reports absolute counts only: tokens for token pools, slots for mamba,
+    // no percentage anywhere in it. A count's denominator supports no action; the TUI's
+    // pools cell carries the alarm itself, driven by the worst non-host fullness.
+    #[test]
+    fn pools_line_reports_absolute_counts_without_percentages() {
+        let body = "# TYPE sglang:token_usage gauge\n\
+             sglang:token_usage 0.0\n\
+             # TYPE sglang:kv_used_tokens gauge\n\
+             sglang:kv_used_tokens 0.0\n\
+             # TYPE sglang:max_total_num_tokens gauge\n\
+             sglang:max_total_num_tokens 655360.0\n\
+             # TYPE sglang:mamba_used_tokens gauge\n\
+             sglang:mamba_used_tokens 8.0\n\
+             # TYPE sglang:mamba_available_tokens gauge\n\
+             sglang:mamba_available_tokens 8.0\n\
+             # TYPE sglang:hicache_host_total_tokens gauge\n\
+             sglang:hicache_host_total_tokens 1000.0\n\
+             # TYPE sglang:hicache_host_used_tokens gauge\n\
+             sglang:hicache_host_used_tokens 0.0\n";
+        let mut h = History::default();
+        let t0 = Instant::now();
+        h.push(t0, parse(body).unwrap());
+        h.push(t0 + std::time::Duration::from_secs(1), parse(body).unwrap());
+        let mut peaks = derive::Peaks::default();
+        let text = snapshot_text(&h, &mut peaks).unwrap();
+        let headline = text.lines().next().unwrap();
+        assert!(
+            headline.contains("KV 0/655k tok"),
+            "headline was: {headline:?}"
+        );
+        assert!(
+            headline.contains("mamba 8/16 slots"),
+            "headline was: {headline:?}"
+        );
+        assert!(
+            headline.contains("host 0/1k tok"),
+            "headline was: {headline:?}"
+        );
+        assert!(
+            !headline.contains('%'),
+            "a percentage leaked into the pools line: {headline:?}"
+        );
+    }
+
     #[test]
     fn headline_sanitizes_hostile_label_values() {
         let body = "# TYPE sglang:num_running_reqs gauge\n\

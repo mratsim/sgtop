@@ -169,41 +169,10 @@ impl History {
         let old = &self.buf[base];
         let new = self.buf.back()?;
 
-        let mut merged: Vec<(f64, f64)> = Vec::new();
-        let mut delta_count: i64 = 0;
-        for (k, h_new) in &new.sample.hist {
-            if !pred(k) {
-                continue;
-            }
-            if let Some(h_old) = old.sample.hist.get(k) {
-                // cumulative counts are comparable only at a boundary
-                // carried by both ladders: walk the two sorted `le` lists
-                // in lockstep and pair the shared bounds. A bound unique
-                // to either side is ladder change, not data.
-                let (mut i_new, mut i_old) = (0usize, 0usize);
-                while let (Some(le_new), Some(le_old)) = (h_new.le.get(i_new), h_old.le.get(i_old))
-                {
-                    match le_new
-                        .partial_cmp(le_old)
-                        .expect("bucket bounds are finite or +Inf, so they always order")
-                    {
-                        std::cmp::Ordering::Equal => {
-                            let c_new = h_new.counts.get(i_new).copied().unwrap_or(0.0);
-                            let c_old = h_old.counts.get(i_old).copied().unwrap_or(0.0);
-                            merged.push((*le_new, c_new - c_old));
-                            i_new += 1;
-                            i_old += 1;
-                        }
-                        std::cmp::Ordering::Less => i_new += 1,
-                        std::cmp::Ordering::Greater => i_old += 1,
-                    }
-                }
-                delta_count += h_new.count as i64 - h_old.count as i64;
-            }
-        }
-        let merged = merge_le(merged);
+        let (raw, delta_count) = hist_family_deltas(&old.sample, &new.sample, &pred);
+        let merged = merge_le(raw);
         let reset = merged.iter().any(|(_, d)| *d < -0.5);
-        if merged.is_empty() || reset || delta_count < 5 {
+        if merged.is_empty() || reset || delta_count < QUANTILE_MIN_OBS {
             return self.hist_snapshot_quantile(&pred, q);
         }
         quantile_from_buckets(&merged, q)
@@ -303,4 +272,83 @@ pub fn quantile_from_buckets(buckets: &[(f64, f64)], q: f64) -> Option<f64> {
         .rev()
         .find(|(le, _)| le.is_finite())
         .map(|(le, _)| *le)
+}
+
+/// Histogram bucket deltas between two samples for every family matching `pred`. Bucket
+/// counts pair by `le` boundary value: a ladder that gains or loses a bucket never shifts
+/// the pairing, and the paired deltas sum across label combinations. Returns the raw
+/// paired deltas and the total observation-count delta across the families.
+///
+/// Cumulative counters make any two ring samples comparable this way: a quantile is computable
+/// for a position inside the window (`hist_window_quantiles`) as well as for the window as a whole
+/// (`History::hist_quantile`).
+///
+/// Minimum bucket-delta observation count a quantile interpolation needs:
+/// the sparse-data bar covers the window quantile and the per-position
+/// series (`History::hist_quantile`, `hist_window_quantiles`).
+pub(crate) const QUANTILE_MIN_OBS: i64 = 5;
+
+pub(crate) fn hist_family_deltas<F>(old: &Sample, new: &Sample, pred: &F) -> (Vec<(f64, f64)>, i64)
+where
+    F: Fn(&SeriesKey) -> bool,
+{
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    let mut delta_count: i64 = 0;
+    for (k, h_new) in &new.hist {
+        if !pred(k) {
+            continue;
+        }
+        if let Some(h_old) = old.hist.get(k) {
+            // cumulative counts are comparable only at a boundary
+            // carried by both ladders: walk the two sorted `le` lists
+            // in lockstep and pair the shared bounds. A bound unique
+            // to either side is ladder change, not data.
+            let (mut i_new, mut i_old) = (0usize, 0usize);
+            while let (Some(le_new), Some(le_old)) = (h_new.le.get(i_new), h_old.le.get(i_old)) {
+                match le_new
+                    .partial_cmp(le_old)
+                    .expect("bucket bounds are finite or +Inf, so they always order")
+                {
+                    std::cmp::Ordering::Equal => {
+                        let c_new = h_new.counts.get(i_new).copied().unwrap_or(0.0);
+                        let c_old = h_old.counts.get(i_old).copied().unwrap_or(0.0);
+                        merged.push((*le_new, c_new - c_old));
+                        i_new += 1;
+                        i_old += 1;
+                    }
+                    std::cmp::Ordering::Less => i_new += 1,
+                    std::cmp::Ordering::Greater => i_old += 1,
+                }
+            }
+            delta_count += h_new.count as i64 - h_old.count as i64;
+        }
+    }
+    (merged, delta_count)
+}
+
+/// p50 and p95 of a histogram family over the span between two samples, from the bucket
+/// deltas (`hist_family_deltas`). One latency point of the per-position series the latency
+/// plots draw: the span runs from the window's first sample to the position's later sample,
+/// so the newest point is the window's headline quantile. Returns None for a span too
+/// sparse to interpolate or a ladder delta that went backwards (a reset). "Too sparse"
+/// means fewer than QUANTILE_MIN_OBS observations, the same bar `hist_quantile` applies. No snapshot
+/// fallback runs, so a plotted point is only ever measured data.
+pub(crate) fn hist_window_quantiles<F>(
+    old: &Sample,
+    new: &Sample,
+    pred: &F,
+) -> (Option<f64>, Option<f64>)
+where
+    F: Fn(&SeriesKey) -> bool,
+{
+    let (raw, delta_count) = hist_family_deltas(old, new, pred);
+    let merged = merge_le(raw);
+    let reset = merged.iter().any(|(_, d)| *d < -0.5);
+    if merged.is_empty() || reset || delta_count < QUANTILE_MIN_OBS {
+        return (None, None);
+    }
+    (
+        quantile_from_buckets(&merged, 0.50),
+        quantile_from_buckets(&merged, 0.95),
+    )
 }

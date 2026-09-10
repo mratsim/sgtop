@@ -17,6 +17,8 @@ pub struct Shared {
     pub interval_ms: std::sync::atomic::AtomicU64,
     /// session peak rates (see derive::Peaks)
     pub peaks: Mutex<crate::derive::Peaks>,
+    /// session-sticky alarm latches (see derive::Alarms)
+    pub alarms: Mutex<crate::derive::Alarms>,
 }
 
 impl Shared {
@@ -28,6 +30,7 @@ impl Shared {
             paused: AtomicBool::new(false),
             interval_ms: std::sync::atomic::AtomicU64::new(1000),
             peaks: Mutex::new(crate::derive::Peaks::default()),
+            alarms: Mutex::new(crate::derive::Alarms::default()),
         })
     }
 }
@@ -174,6 +177,11 @@ pub fn spawn_scraper(shared: Arc<Shared>, url: String, api_key: Option<String>, 
                         if let Ok(mut p) = shared.peaks.lock() {
                             if let Ok(h) = shared.history.lock() {
                                 crate::derive::update_peaks(&mut p, &h);
+                            }
+                        }
+                        if let Ok(mut a) = shared.alarms.lock() {
+                            if let Ok(h) = shared.history.lock() {
+                                crate::derive::update_alarms(&mut a, &h);
                             }
                         }
                         if let Ok(mut t) = shared.last_ok.lock() {
